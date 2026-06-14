@@ -56,6 +56,7 @@ Each module has a dedicated test file in `test/`. Write and run its test before 
 - Use `$assert(cond)` for checks, `$finish()` to end simulation
 - Use small `CLK_FREQ` (e.g. 16) with divisor=1 for fast simulation (1 baud bit = 16 clocks)
 - Test files are included via `sources = ["src", "test"]` in `Veryl.toml`
+- When instantiating a DUT with `clock`/`reset` typed ports, omit those ports and annotate with `#[allow(missing_port)]` — the native test runner connects them implicitly via `$tb::clock_gen`
 
 ### Test coverage per module
 

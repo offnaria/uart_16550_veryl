@@ -1,0 +1,116 @@
+// BaudGen tests.
+// Each test checks that consecutive o_en pulses are exactly i_div cycles apart.
+// Startup state: after $tb reset, r_counter=0 with div still 0, so the
+// counter is deterministically at 0 when the initial block sets div.
+
+// Verify period = 4 with div=4.
+#[test(test_baud_gen_period_4)]
+module test_baud_gen_period_4 {
+    inst u_clock: $tb::clock_gen;
+
+    var div        : logic<16>;
+    var o_en       : logic;
+    var last_cycle : logic<8>;
+    var cur_cycle  : logic<8>;
+    var first_seen : logic;
+    var pulse_count: logic<8>;
+
+    #[allow(missing_port)]
+    inst u_dut: BaudGen (
+        i_div: div,
+        o_en ,
+    );
+
+    initial {
+        div         = 4;
+        last_cycle  = '0;
+        cur_cycle   = '0;
+        first_seen  = '0;
+        pulse_count = '0;
+
+        for _i in 0..40 {
+            u_clock.next(1);
+            cur_cycle = cur_cycle + 1;
+            if o_en {
+                if first_seen {
+                    $assert(cur_cycle - last_cycle == 4);
+                }
+                last_cycle  = cur_cycle;
+                first_seen  = '1;
+                pulse_count = pulse_count + 1;
+            }
+        }
+        $assert(pulse_count == 10); // 40 cycles / period 4 = 10 pulses
+
+        $finish();
+    }
+}
+
+// Verify period = 8 with div=8.
+#[test(test_baud_gen_period_8)]
+module test_baud_gen_period_8 {
+    inst u_clock: $tb::clock_gen;
+
+    var div        : logic<16>;
+    var o_en       : logic;
+    var last_cycle : logic<8>;
+    var cur_cycle  : logic<8>;
+    var first_seen : logic;
+    var pulse_count: logic<8>;
+
+    #[allow(missing_port)]
+    inst u_dut: BaudGen (
+        i_div: div,
+        o_en ,
+    );
+
+    initial {
+        div         = 8;
+        last_cycle  = '0;
+        cur_cycle   = '0;
+        first_seen  = '0;
+        pulse_count = '0;
+
+        for _i in 0..80 {
+            u_clock.next(1);
+            cur_cycle = cur_cycle + 1;
+            if o_en {
+                if first_seen {
+                    $assert(cur_cycle - last_cycle == 8);
+                }
+                last_cycle  = cur_cycle;
+                first_seen  = '1;
+                pulse_count = pulse_count + 1;
+            }
+        }
+        $assert(pulse_count == 10); // 80 cycles / period 8 = 10 pulses
+
+        $finish();
+    }
+}
+
+// Verify div=0 produces no pulses.
+#[test(test_baud_gen_disabled)]
+module test_baud_gen_disabled {
+    inst u_clock: $tb::clock_gen;
+
+    var div : logic<16>;
+    var o_en: logic;
+
+    #[allow(missing_port)]
+    inst u_dut: BaudGen (
+        i_div: div,
+        o_en ,
+    );
+
+    initial {
+        div = '0;
+
+        for _i in 0..20 {
+            u_clock.next(1);
+            $assert(!o_en);
+        }
+
+        $finish();
+    }
+}
