@@ -45,16 +45,37 @@ veryl test --sim verilator --wave   # also dump waveforms
 - Array of registers: `var mem: logic<W> [N];` — elements are writeable inside `always_ff`.
 - Standard library is under `$std` namespace; no dependency declaration needed. Example: `inst u: $std::fifo #(WIDTH: 8, DEPTH: 16) (i_clk: _, ...);`
 
+## Testing Policy
+
+Each module has a dedicated test file in `test/`. Write and run its test before moving to the next module. Run all tests with `veryl test --sim verilator`.
+
+### Test file conventions
+
+- File: `test/test_<module>.veryl`, one `#[test(name)]` module per scenario
+- Use `inst u_clock: $tb::clock_gen;` for clock, `u_clock.next(N)` to advance N cycles
+- Use `$assert(cond)` for checks, `$finish()` to end simulation
+- Use small `CLK_FREQ` (e.g. 16) with divisor=1 for fast simulation (1 baud bit = 16 clocks)
+- Test files are included via `sources = ["src", "test"]` in `Veryl.toml`
+
+### Test coverage per module
+
+| Test file | Module under test | What to verify |
+|---|---|---|
+| `test/test_baud_gen.veryl` | `BaudGen` | `o_en` pulse period matches `divisor × 16` clocks; divisor change takes effect immediately |
+| `test/test_uart_tx.veryl` | `UartTx` | Correct bit stream on `o_txd`: start=0, data LSB-first, parity (if enabled), stop=1; `o_idle` and `o_fifo_full` timing |
+| `test/test_uart_rx.veryl` | `UartRx` | Valid frame → correct data + no errors; framing error; parity error; overrun when FIFO full |
+| `test/test_uart_16550.veryl` | `Uart16550` | AXI write DLL/DLM + LCR; AXI write THR → verify TX bitstream; drive RXD → AXI read RBR; loopback mode; interrupt assertion/deassertion |
+
 ## Development Plan
 
-Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed). Implementation is split into four source files built bottom-up:
+Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed). Implementation is split into four source files built bottom-up. **Each step includes writing and passing the corresponding test before proceeding.**
 
-| Step | File | Module | Status |
+| Step | Src file | Test file | Status |
 |---|---|---|---|
-| 1 | `src/baud_gen.veryl` | `BaudGen` | 🔲 pending |
-| 2 | `src/uart_tx.veryl` | `UartTx` | 🔲 pending |
-| 3 | `src/uart_rx.veryl` | `UartRx` | 🔲 pending |
-| 4 | `src/uart_16550.veryl` | `Uart16550` | 🔲 pending |
+| 1 | `src/baud_gen.veryl` | `test/test_baud_gen.veryl` | 🔲 pending |
+| 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | 🔲 pending |
+| 3 | `src/uart_rx.veryl` | `test/test_uart_rx.veryl` | 🔲 pending |
+| 4 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
 
 ### `$std::fifo` usage
 - TX FIFO: `$std::fifo #(WIDTH: 8, DEPTH: 16)` — `i_clear` maps to FCR.TXRST

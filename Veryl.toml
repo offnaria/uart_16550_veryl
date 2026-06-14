@@ -4,5 +4,5 @@ version = "0.1.0"
 [build]
 clock_type = "posedge"
 reset_type = "sync_low"
-sources = ["src"]
+sources = ["src", "test"]
 target = {type = "directory", path = "target"}
