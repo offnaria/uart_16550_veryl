@@ -43,46 +43,46 @@ veryl test --sim verilator --wave   # also dump waveforms
 - `reset_type = "sync_low"` and `clock_type = "posedge"` are set in `Veryl.toml`.
 - `let x: T = expr;` declares a combinational (wire) signal at module scope.
 - Array of registers: `var mem: logic<W> [N];` — elements are writeable inside `always_ff`.
+- Standard library is under `$std` namespace; no dependency declaration needed. Example: `inst u: $std::fifo #(WIDTH: 8, DEPTH: 16) (i_clk: _, ...);`
 
 ## Development Plan
 
-Full design spec is in `SPEC.md`. Implementation is split into five source files built bottom-up:
+Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed). Implementation is split into four source files built bottom-up:
 
 | Step | File | Module | Status |
 |---|---|---|---|
-| 1 | `src/fifo16.veryl` | `Fifo16` | 🔲 in progress |
-| 2 | `src/baud_gen.veryl` | `BaudGen` | 🔲 pending |
-| 3 | `src/uart_tx.veryl` | `UartTx` | 🔲 pending |
-| 4 | `src/uart_rx.veryl` | `UartRx` | 🔲 pending |
-| 5 | `src/uart_16550.veryl` | `Uart16550` | 🔲 pending |
+| 1 | `src/baud_gen.veryl` | `BaudGen` | 🔲 pending |
+| 2 | `src/uart_tx.veryl` | `UartTx` | 🔲 pending |
+| 3 | `src/uart_rx.veryl` | `UartRx` | 🔲 pending |
+| 4 | `src/uart_16550.veryl` | `Uart16550` | 🔲 pending |
 
-### Step 1 — `Fifo16`
-16-entry first-word fall-through FIFO, parameterized by `WIDTH`.
-- TX path uses `WIDTH=8`; RX path uses `WIDTH=11` (`{BI, FE, PE, data[7:0]}`).
-- 5-bit gray-style pointers: bit 4 is wrap flag; full/empty detected by pointer comparison.
-- Ports: `i_wr_en`, `i_wr_data`, `o_full`, `i_rd_en`, `o_rd_data`, `o_empty`, `o_count`.
+### `$std::fifo` usage
+- TX FIFO: `$std::fifo #(WIDTH: 8, DEPTH: 16)` — `i_clear` maps to FCR.TXRST
+- RX FIFO: `$std::fifo #(WIDTH: 11, DEPTH: 16)` — stores `{BI, FE, PE, data[7:0]}`; `i_clear` maps to FCR.RXRST
+- `o_word_count` is `logic<5>` (0–16); compare against RX trigger level for RDA interrupt
+- `DATA_FF_OUT = true` (default): `o_data` is registered — capture it in the same cycle ARVALID is accepted, before asserting `i_pop`
 
-### Step 2 — `BaudGen`
+### Step 1 — `BaudGen`
 Generates a 1-cycle `o_en` pulse at 16× the baud rate.
 - Input: 16-bit divisor `i_div` (from `{DLM, DLL}`), reload when divisor changes.
 - Counter counts down from `i_div` to `1`; pulses `o_en` at rollover.
 - Baud = `CLK_FREQ / (divisor × 16)`.
 
-### Step 3 — `UartTx`
+### Step 2 — `UartTx`
 TX shift register driven by `BaudGen`'s 16× enable.
 - Loads next byte from TX FIFO when shift register becomes idle.
 - Outputs start bit (0), data LSB-first, optional parity, stop bit(s).
 - Exposes `o_fifo_full` and `o_idle` for LSR `THRE`/`TEMT` bits.
 - Word length, parity, stop bits configured via LCR fields passed as ports.
 
-### Step 4 — `UartRx`
+### Step 3 — `UartRx`
 16× oversampling receiver; samples at tick 8 of each bit period.
 - Start-bit detection on falling edge of `i_rxd`.
 - Detects PE (parity error), FE (framing error), BI (break interrupt).
 - Writes `{BI, FE, PE, data[7:0]}` into RX FIFO; signals OE when FIFO full.
 - Word length, parity configured via LCR fields passed as ports.
 
-### Step 5 — `Uart16550` (top level)
+### Step 4 — `Uart16550` (top level)
 AXI4-Lite slave + register file + interrupt logic + loopback.
 - AW/W accepted simultaneously; BRESP next cycle; AR→RDATA next cycle.
 - Register decode: offset bits `[4:2]` select register; DLAB gates DLL/DLM vs RBR/THR/IER.

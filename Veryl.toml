@@ -2,5 +2,7 @@
 name = "uart_16550_veryl"
 version = "0.1.0"
 [build]
+clock_type = "posedge"
+reset_type = "sync_low"
 sources = ["src"]
 target = {type = "directory", path = "target"}
