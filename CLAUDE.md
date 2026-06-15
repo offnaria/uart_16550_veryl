@@ -23,7 +23,7 @@ Pass `--sim` to choose a simulator: `verilator` (default), `vcs`, `dsim`, or `vi
 
 ```bash
 veryl test --sim verilator
-veryl test --sim verilator --wave   # also dump waveforms
+veryl test --sim verilator --wave   # also dump waveforms (*.vcd written to test/)
 ```
 
 ## Project Layout
