@@ -6,3 +6,5 @@ clock_type = "posedge"
 reset_type = "sync_low"
 sources = ["src", "test"]
 target = {type = "directory", path = "target"}
+[test.verilator]
+compile_args = ["-Wno-WIDTHEXPAND"]

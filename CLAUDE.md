@@ -73,8 +73,8 @@ Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed)
 
 | Step | Src file | Test file | Status |
 |---|---|---|---|
-| 1 | `src/baud_gen.veryl` | `test/test_baud_gen.veryl` | 🔲 pending |
-| 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | 🔲 pending |
+| 1 | `src/baud_gen.veryl` | `test/test_baud_gen.veryl` | ✅ done |
+| 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | ✅ done |
 | 3 | `src/uart_rx.veryl` | `test/test_uart_rx.veryl` | 🔲 pending |
 | 4 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
 
