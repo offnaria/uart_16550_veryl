@@ -6,3 +6,6 @@
 
 # Verilator
 obj_dir/
+
+# Waveform
+*.vcd
