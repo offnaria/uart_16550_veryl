@@ -1,0 +1,186 @@
+pub module UartTx (
+    i_clk      : input  clock   ,
+    i_rst_n    : input  reset   ,
+    i_baud_en  : input  logic   ,
+    i_push     : input  logic   ,
+    i_data     : input  logic<8>,
+    i_clear    : input  logic   ,
+    i_lcr_wls  : input  logic<2>,
+    i_lcr_stb  : input  logic   ,
+    i_lcr_pen  : input  logic   ,
+    i_lcr_eps  : input  logic   ,
+    i_lcr_sp   : input  logic   ,
+    i_lcr_bc   : input  logic   ,
+    o_txd      : output logic   ,
+    o_fifo_full: output logic   ,
+    o_idle     : output logic   ,
+) {
+    var fifo_pop        : logic   ;
+    var fifo_data       : logic<8>;
+    var fifo_empty      : logic   ;
+    var fifo_full       : logic   ;
+    var fifo_almost_full: logic   ;
+    var fifo_word_count : logic<5>;
+
+    inst u_tx_fifo: $std::fifo #(
+        WIDTH: 8 ,
+        DEPTH: 16,
+    ) (
+        i_clk        : i_clk           ,
+        i_rst        : i_rst_n         ,
+        i_clear      : i_clear         ,
+        i_push       : i_push          ,
+        i_data       : i_data          ,
+        i_pop        : fifo_pop        ,
+        o_data       : fifo_data       ,
+        o_full       : fifo_full       ,
+        o_almost_full: fifo_almost_full,
+        o_word_count : fifo_word_count ,
+        o_empty      : fifo_empty      ,
+    );
+
+    enum TxState: logic<3> {
+        Idle,
+        Start,
+        Data,
+        Par,
+        Stop,
+    }
+
+    var r_state  : TxState   ;
+    var r_tick   : logic  <4>;
+    var r_shift  : logic  <8>;
+    var r_bit_idx: logic  <3>;
+    var r_parity : logic     ;
+    var r_stop2  : logic     ;
+    var r_txd    : logic     ;
+
+    // Last data bit index: WLS=00→4, WLS=01→5, WLS=10→6, WLS=11→7
+    var w_last_bit: logic<3>;
+    always_comb {
+        if i_lcr_wls == 2'd0 {
+            w_last_bit = 3'd4;
+        } else if i_lcr_wls == 2'd1 {
+            w_last_bit = 3'd5;
+        } else if i_lcr_wls == 2'd2 {
+            w_last_bit = 3'd6;
+        } else {
+            w_last_bit = 3'd7;
+        }
+    }
+
+    // Parity bit: stick overrides even/odd
+    var w_par_bit: logic;
+    always_comb {
+        if i_lcr_sp {
+            w_par_bit = !i_lcr_eps;
+        } else if i_lcr_eps {
+            w_par_bit = r_parity;
+        } else {
+            w_par_bit = !r_parity;
+        }
+    }
+
+    always_ff {
+        if_reset {
+            r_state   = TxState::Idle;
+            r_tick    = '0;
+            r_shift   = '0;
+            r_bit_idx = '0;
+            r_parity  = '0;
+            r_stop2   = '0;
+            r_txd     = '1;
+            fifo_pop  = '0;
+        } else {
+            fifo_pop = '0;
+            if i_clear {
+                r_state = TxState::Idle;
+                r_tick  = '0;
+                r_txd   = '1;
+            } else {
+                case r_state {
+                    TxState::Idle: {
+                        r_txd = '1;
+                        // Start a new frame on a baud_en boundary so timing is aligned.
+                        if !fifo_empty && i_baud_en {
+                            fifo_pop  = '1;
+                            r_shift   = fifo_data;
+                            r_parity  = '0;
+                            r_bit_idx = '0;
+                            r_tick    = '0;
+                            r_state   = TxState::Start;
+                        }
+                    }
+                    TxState::Start: {
+                        r_txd = '0;
+                        if i_baud_en {
+                            if r_tick == 4'd15 {
+                                r_tick  = '0;
+                                r_state = TxState::Data;
+                            } else {
+                                r_tick = r_tick + 1;
+                            }
+                        }
+                    }
+                    TxState::Data: {
+                        r_txd = r_shift[0];
+                        if i_baud_en {
+                            if r_tick == 4'd15 {
+                                r_tick   = '0;
+                                r_parity = r_parity ^ r_shift[0];
+                                r_shift  = {1'b0, r_shift[7:1]};
+                                if r_bit_idx == w_last_bit {
+                                    if i_lcr_pen {
+                                        r_state = TxState::Par;
+                                    } else {
+                                        r_stop2 = i_lcr_stb;
+                                        r_state = TxState::Stop;
+                                    }
+                                } else {
+                                    r_bit_idx = r_bit_idx + 1;
+                                }
+                            } else {
+                                r_tick = r_tick + 1;
+                            }
+                        }
+                    }
+                    TxState::Par: {
+                        r_txd = w_par_bit;
+                        if i_baud_en {
+                            if r_tick == 4'd15 {
+                                r_tick  = '0;
+                                r_stop2 = i_lcr_stb;
+                                r_state = TxState::Stop;
+                            } else {
+                                r_tick = r_tick + 1;
+                            }
+                        }
+                    }
+                    TxState::Stop: {
+                        r_txd = '1;
+                        if i_baud_en {
+                            if r_tick == 4'd15 {
+                                r_tick = '0;
+                                if r_stop2 {
+                                    r_stop2 = '0;
+                                } else {
+                                    r_state = TxState::Idle;
+                                }
+                            } else {
+                                r_tick = r_tick + 1;
+                            }
+                        }
+                    }
+                    default: {
+                        r_state = TxState::Idle;
+                    }
+                }
+            }
+        }
+    }
+
+    // BC (break control) forces TXD to space (0) regardless of shift register.
+    assign o_txd       = r_txd & ~i_lcr_bc;
+    assign o_fifo_full = fifo_full;
+    assign o_idle      = fifo_empty && (r_state == TxState::Idle);
+}

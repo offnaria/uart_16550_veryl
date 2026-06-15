@@ -1,0 +1,438 @@
+// UartTx tests — embedded SystemVerilog testbenches.
+// Clock period = 10 ns; baud_en tied high so 1 clock = 1 baud tick,
+// 16 clocks = 1 bit period.  Bits sampled at tick 7 (8th clock = centre).
+//
+// Reset: 5 cycles, then 3 settle clocks for FIFO FLAG_FF_OUT to initialise.
+
+// ─── Helper task (shared via include-in-module pattern) ──────────────────────
+// sample_bit: advances 16 clocks and returns o_txd at tick 7.
+
+// ─── Test 1: 8N1 — send 0xA5, verify bit stream ─────────────────────────────
+#[test(test_uart_tx_8n1)]
+embed (inline) sv{{{
+    module test_uart_tx_8n1;
+        logic       clk;
+        logic       rst_n;
+        logic       baud_en;
+        logic       push;
+        logic [7:0] pdata;
+        logic       o_txd;
+        logic       o_idle;
+        logic       o_full;
+
+        uart_16550_veryl_UartTx u_dut (
+            .i_clk      (clk    ),
+            .i_rst_n    (rst_n  ),
+            .i_baud_en  (baud_en),
+            .i_push     (push   ),
+            .i_data     (pdata  ),
+            .i_clear    (1'b0   ),
+            .i_lcr_wls  (2'd3   ),
+            .i_lcr_stb  (1'b0   ),
+            .i_lcr_pen  (1'b0   ),
+            .i_lcr_eps  (1'b0   ),
+            .i_lcr_sp   (1'b0   ),
+            .i_lcr_bc   (1'b0   ),
+            .o_txd      (o_txd  ),
+            .o_idle     (o_idle ),
+            .o_fifo_full(o_full )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        // Advance n full clock cycles.
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        // Sample o_txd at the centre of a 16-clock bit period.
+        task automatic sample_bit(output logic val);
+            for (int tick = 0; tick < 16; tick++) begin
+                @(posedge clk);
+                if (tick == 7) val = o_txd;
+            end
+        endtask
+
+        logic [7:0] exp_data;
+        logic       smp;
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 0;
+            push    = 0;
+            pdata   = 0;
+
+            // Apply reset then settle FIFO flags.
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // Push 0xA5.
+            push  = 1;
+            pdata = 8'hA5;
+            next(1);
+            push = 0;
+            next(1); // FLAG_FF_OUT latency: fifo_empty goes 0
+
+            // Enable baud; Idle sees fifo_empty=0 → Idle→Start.
+            baud_en = 1;
+            next(1);
+
+            // ── Start bit (expect 0) ──────────────────────────────────────
+            sample_bit(smp);
+            if (smp !== 1'b0) $fatal(1, "Start bit: expected 0, got %b", smp);
+
+            // ── Data bits 0–7 (0xA5 = 10100101, LSB-first) ───────────────
+            exp_data = 8'hA5;
+            for (int bit_i = 0; bit_i < 8; bit_i++) begin
+                sample_bit(smp);
+                if (smp !== exp_data[bit_i])
+                    $fatal(1, "Data bit %0d: expected %b, got %b",
+                           bit_i, exp_data[bit_i], smp);
+            end
+
+            // ── Stop bit (expect 1) ───────────────────────────────────────
+            sample_bit(smp);
+            if (smp !== 1'b1) $fatal(1, "Stop bit: expected 1, got %b", smp);
+
+            // TX returns to Idle.
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle=1 after frame");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 2: FIFO full flag and o_idle ───────────────────────────────────────
+// Fill FIFO with 16 writes → o_fifo_full=1.
+// Drain with baud_en → o_idle=1 afterwards.
+#[test(test_uart_tx_flags)]
+embed (inline) sv{{{
+    module test_uart_tx_flags;
+        logic       clk;
+        logic       rst_n;
+        logic       baud_en;
+        logic       push;
+        logic [7:0] pdata;
+        logic       o_txd;
+        logic       o_idle;
+        logic       o_full;
+
+        uart_16550_veryl_UartTx u_dut (
+            .i_clk      (clk    ),
+            .i_rst_n    (rst_n  ),
+            .i_baud_en  (baud_en),
+            .i_push     (push   ),
+            .i_data     (pdata  ),
+            .i_clear    (1'b0   ),
+            .i_lcr_wls  (2'd3   ),
+            .i_lcr_stb  (1'b0   ),
+            .i_lcr_pen  (1'b0   ),
+            .i_lcr_eps  (1'b0   ),
+            .i_lcr_sp   (1'b0   ),
+            .i_lcr_bc   (1'b0   ),
+            .o_txd      (o_txd  ),
+            .o_idle     (o_idle ),
+            .o_fifo_full(o_full )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 0;
+            push    = 0;
+            pdata   = 8'hAB;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // Fill FIFO: 16 pushes.
+            for (int i = 0; i < 16; i++) begin
+                push = 1;
+                next(1);
+            end
+            push = 0;
+            next(1); // FLAG_FF_OUT latency: o_full asserts
+            @(posedge clk);
+            if (!o_full) $fatal(1, "Expected o_fifo_full=1 after 16 pushes");
+
+            // Drain: 16 frames × 10 bits × 16 ticks + margin = 2600 clocks.
+            baud_en = 1;
+            next(2600);
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle=1 after draining FIFO");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 3: even parity (8E1) ───────────────────────────────────────────────
+// LCR: WLS=11, PEN=1, EPS=1.
+// 0x00 → 0 ones → XOR=0 → even parity=0.
+// 0xFF → 8 ones → XOR=0 → even parity=0.
+// 0x01 → 1 one  → XOR=1 → even parity=1.  (exercises the parity=1 path)
+#[test(test_uart_tx_even_parity)]
+embed (inline) sv{{{
+    module test_uart_tx_even_parity;
+        logic       clk;
+        logic       rst_n;
+        logic       baud_en;
+        logic       push;
+        logic [7:0] pdata;
+        logic       o_txd;
+        logic       o_idle;
+        logic       o_full;
+
+        uart_16550_veryl_UartTx u_dut (
+            .i_clk      (clk    ),
+            .i_rst_n    (rst_n  ),
+            .i_baud_en  (baud_en),
+            .i_push     (push   ),
+            .i_data     (pdata  ),
+            .i_clear    (1'b0   ),
+            .i_lcr_wls  (2'd3   ),
+            .i_lcr_stb  (1'b0   ),
+            .i_lcr_pen  (1'b1   ),
+            .i_lcr_eps  (1'b1   ),
+            .i_lcr_sp   (1'b0   ),
+            .i_lcr_bc   (1'b0   ),
+            .o_txd      (o_txd  ),
+            .o_idle     (o_idle ),
+            .o_fifo_full(o_full )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic sample_bit(output logic val);
+            for (int tick = 0; tick < 16; tick++) begin
+                @(posedge clk);
+                if (tick == 7) val = o_txd;
+            end
+        endtask
+
+        // Skip N full bit periods without sampling.
+        task automatic skip_bits(input int n);
+            repeat (n) begin
+                repeat (16) @(posedge clk);
+            end
+        endtask
+
+        logic par_smp;
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 0;
+            push    = 0;
+            pdata   = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // ── Frame for 0x00 ────────────────────────────────────────────
+            push  = 1;
+            pdata = 8'h00;
+            next(1);
+            push = 0;
+            next(1);
+
+            baud_en = 1;
+            next(1); // Idle → Start
+
+            // Skip start + 8 data bits = 9 bit periods.
+            skip_bits(9);
+
+            // Sample parity bit (bit period 9, 0-indexed after Idle→Start).
+            sample_bit(par_smp);
+            if (par_smp !== 1'b0)
+                $fatal(1, "0x00 parity: expected even=0, got %b", par_smp);
+
+            // Skip stop bit, then wait for Idle.
+            skip_bits(1);
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle after 0x00 frame");
+
+            // ── Frame for 0xFF ────────────────────────────────────────────
+            push  = 1;
+            pdata = 8'hFF;
+            next(1);
+            push = 0;
+            next(1);
+
+            next(1); // Idle → Start (baud_en still 1)
+
+            skip_bits(9);
+
+            sample_bit(par_smp);
+            if (par_smp !== 1'b0)
+                $fatal(1, "0xFF parity: expected even=0, got %b", par_smp);
+
+            skip_bits(1);
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle after 0xFF frame");
+
+            // ── Frame for 0x01 (1 set bit → even parity = 1) ────────────
+            push  = 1;
+            pdata = 8'h01;
+            next(1);
+            push = 0;
+            next(1);
+
+            next(1); // Idle → Start (baud_en still 1)
+
+            skip_bits(9);
+
+            sample_bit(par_smp);
+            if (par_smp !== 1'b1)
+                $fatal(1, "0x01 parity: expected even=1, got %b", par_smp);
+
+            skip_bits(1);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 4: odd parity (8O1) ────────────────────────────────────────────────
+// LCR: WLS=11, PEN=1, EPS=0.
+// w_par_bit = !r_parity (odd parity).
+// 0x00 → XOR=0 → !0=1 (odd parity=1).
+// 0xFF → XOR=0 → !0=1 (odd parity=1).
+// 0x01 → XOR=1 → !1=0 (odd parity=0).
+#[test(test_uart_tx_odd_parity)]
+embed (inline) sv{{{
+    module test_uart_tx_odd_parity;
+        logic       clk;
+        logic       rst_n;
+        logic       baud_en;
+        logic       push;
+        logic [7:0] pdata;
+        logic       o_txd;
+        logic       o_idle;
+        logic       o_full;
+
+        uart_16550_veryl_UartTx u_dut (
+            .i_clk      (clk    ),
+            .i_rst_n    (rst_n  ),
+            .i_baud_en  (baud_en),
+            .i_push     (push   ),
+            .i_data     (pdata  ),
+            .i_clear    (1'b0   ),
+            .i_lcr_wls  (2'd3   ),
+            .i_lcr_stb  (1'b0   ),
+            .i_lcr_pen  (1'b1   ),
+            .i_lcr_eps  (1'b0   ),
+            .i_lcr_sp   (1'b0   ),
+            .i_lcr_bc   (1'b0   ),
+            .o_txd      (o_txd  ),
+            .o_idle     (o_idle ),
+            .o_fifo_full(o_full )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic sample_bit(output logic val);
+            for (int tick = 0; tick < 16; tick++) begin
+                @(posedge clk);
+                if (tick == 7) val = o_txd;
+            end
+        endtask
+
+        task automatic skip_bits(input int n);
+            repeat (n) begin
+                repeat (16) @(posedge clk);
+            end
+        endtask
+
+        logic par_smp;
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 0;
+            push    = 0;
+            pdata   = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // ── Frame for 0x00 (XOR=0 → odd parity=1) ───────────────────
+            push  = 1;
+            pdata = 8'h00;
+            next(1);
+            push = 0;
+            next(1);
+
+            baud_en = 1;
+            next(1); // Idle → Start
+
+            skip_bits(9);
+
+            sample_bit(par_smp);
+            if (par_smp !== 1'b1)
+                $fatal(1, "0x00 odd parity: expected 1, got %b", par_smp);
+
+            skip_bits(1);
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle after 0x00 frame");
+
+            // ── Frame for 0xFF (XOR=0 → odd parity=1) ───────────────────
+            push  = 1;
+            pdata = 8'hFF;
+            next(1);
+            push = 0;
+            next(1);
+
+            next(1); // Idle → Start (baud_en still 1)
+
+            skip_bits(9);
+
+            sample_bit(par_smp);
+            if (par_smp !== 1'b1)
+                $fatal(1, "0xFF odd parity: expected 1, got %b", par_smp);
+
+            skip_bits(1);
+            @(posedge clk);
+            if (!o_idle) $fatal(1, "Expected o_idle after 0xFF frame");
+
+            // ── Frame for 0x01 (XOR=1 → odd parity=0) ───────────────────
+            push  = 1;
+            pdata = 8'h01;
+            next(1);
+            push = 0;
+            next(1);
+
+            next(1); // Idle → Start (baud_en still 1)
+
+            skip_bits(9);
+
+            sample_bit(par_smp);
+            if (par_smp !== 1'b0)
+                $fatal(1, "0x01 odd parity: expected 0, got %b", par_smp);
+
+            skip_bits(1);
+
+            $finish();
+        end
+    endmodule
+}}}
