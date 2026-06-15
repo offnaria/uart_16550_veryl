@@ -1,116 +1,142 @@
-// BaudGen tests.
-// Each test checks that consecutive o_en pulses are exactly i_div cycles apart.
-// Startup state: after $tb reset, r_counter=0 with div still 0, so the
-// counter is deterministically at 0 when the initial block sets div.
+// BaudGen tests — converted to embedded SystemVerilog testbenches.
+// Clock period = 10 ns; reset held for 5 cycles.
+// After reset, r_counter=0; with div=N, o_en fires every N cycles.
 
-// Verify period = 4 with div=4.
 #[test(test_baud_gen_period_4)]
-module test_baud_gen_period_4 {
-    inst u_clock: $tb::clock_gen;
+embed (inline) sv{{{
+    module test_baud_gen_period_4;
+        logic        clk;
+        logic        rst_n;
+        logic [15:0] i_div;
+        logic        o_en;
 
-    var div        : logic<16>;
-    var o_en       : logic;
-    var last_cycle : logic<8>;
-    var cur_cycle  : logic<8>;
-    var first_seen : logic;
-    var pulse_count: logic<8>;
+        uart_16550_veryl_BaudGen u_dut (
+            .i_clk  (clk  ),
+            .i_rst_n(rst_n),
+            .i_div  (i_div),
+            .o_en   (o_en )
+        );
 
-    #[allow(missing_port)]
-    inst u_dut: BaudGen (
-        i_div: div,
-        o_en ,
-    );
+        initial clk = 0;
+        always #5 clk = ~clk;
 
-    initial {
-        div         = 4;
-        last_cycle  = '0;
-        cur_cycle   = '0;
-        first_seen  = '0;
-        pulse_count = '0;
+        int   cur_cycle, last_cycle, pulse_count;
+        logic first_seen;
 
-        for _i in 0..40 {
-            u_clock.next(1);
-            cur_cycle = cur_cycle + 1;
-            if o_en {
-                if first_seen {
-                    $assert(cur_cycle - last_cycle == 4);
-                }
-                last_cycle  = cur_cycle;
-                first_seen  = '1;
-                pulse_count = pulse_count + 1;
-            }
-        }
-        $assert(pulse_count == 10); // 40 cycles / period 4 = 10 pulses
+        initial begin
+            rst_n       = 0;
+            i_div       = 4;
+            cur_cycle   = 0;
+            last_cycle  = 0;
+            pulse_count = 0;
+            first_seen  = 0;
 
-        $finish();
-    }
-}
+            repeat (5) @(posedge clk);
+            rst_n = 1;
 
-// Verify period = 8 with div=8.
+            for (int i = 0; i < 40; i++) begin
+                @(posedge clk);
+                cur_cycle++;
+                if (o_en) begin
+                    if (first_seen && (cur_cycle - last_cycle !== 4))
+                        $fatal(1, "Period mismatch at pulse %0d: got %0d, expected 4",
+                               pulse_count, cur_cycle - last_cycle);
+                    last_cycle  = cur_cycle;
+                    first_seen  = 1;
+                    pulse_count++;
+                end
+            end
+
+            if (pulse_count !== 10)
+                $fatal(1, "Expected 10 pulses in 40 cycles, got %0d", pulse_count);
+            $finish();
+        end
+    endmodule
+}}}
+
 #[test(test_baud_gen_period_8)]
-module test_baud_gen_period_8 {
-    inst u_clock: $tb::clock_gen;
+embed (inline) sv{{{
+    module test_baud_gen_period_8;
+        logic        clk;
+        logic        rst_n;
+        logic [15:0] i_div;
+        logic        o_en;
 
-    var div        : logic<16>;
-    var o_en       : logic;
-    var last_cycle : logic<8>;
-    var cur_cycle  : logic<8>;
-    var first_seen : logic;
-    var pulse_count: logic<8>;
+        uart_16550_veryl_BaudGen u_dut (
+            .i_clk  (clk  ),
+            .i_rst_n(rst_n),
+            .i_div  (i_div),
+            .o_en   (o_en )
+        );
 
-    #[allow(missing_port)]
-    inst u_dut: BaudGen (
-        i_div: div,
-        o_en ,
-    );
+        initial clk = 0;
+        always #5 clk = ~clk;
 
-    initial {
-        div         = 8;
-        last_cycle  = '0;
-        cur_cycle   = '0;
-        first_seen  = '0;
-        pulse_count = '0;
+        int   cur_cycle, last_cycle, pulse_count;
+        logic first_seen;
 
-        for _i in 0..80 {
-            u_clock.next(1);
-            cur_cycle = cur_cycle + 1;
-            if o_en {
-                if first_seen {
-                    $assert(cur_cycle - last_cycle == 8);
-                }
-                last_cycle  = cur_cycle;
-                first_seen  = '1;
-                pulse_count = pulse_count + 1;
-            }
-        }
-        $assert(pulse_count == 10); // 80 cycles / period 8 = 10 pulses
+        initial begin
+            rst_n       = 0;
+            i_div       = 8;
+            cur_cycle   = 0;
+            last_cycle  = 0;
+            pulse_count = 0;
+            first_seen  = 0;
 
-        $finish();
-    }
-}
+            repeat (5) @(posedge clk);
+            rst_n = 1;
 
-// Verify div=0 produces no pulses.
+            for (int i = 0; i < 80; i++) begin
+                @(posedge clk);
+                cur_cycle++;
+                if (o_en) begin
+                    if (first_seen && (cur_cycle - last_cycle !== 8))
+                        $fatal(1, "Period mismatch at pulse %0d: got %0d, expected 8",
+                               pulse_count, cur_cycle - last_cycle);
+                    last_cycle  = cur_cycle;
+                    first_seen  = 1;
+                    pulse_count++;
+                end
+            end
+
+            if (pulse_count !== 10)
+                $fatal(1, "Expected 10 pulses in 80 cycles, got %0d", pulse_count);
+            $finish();
+        end
+    endmodule
+}}}
+
 #[test(test_baud_gen_disabled)]
-module test_baud_gen_disabled {
-    inst u_clock: $tb::clock_gen;
+embed (inline) sv{{{
+    module test_baud_gen_disabled;
+        logic        clk;
+        logic        rst_n;
+        logic [15:0] i_div;
+        logic        o_en;
 
-    var div : logic<16>;
-    var o_en: logic;
+        uart_16550_veryl_BaudGen u_dut (
+            .i_clk  (clk  ),
+            .i_rst_n(rst_n),
+            .i_div  (i_div),
+            .o_en   (o_en )
+        );
 
-    #[allow(missing_port)]
-    inst u_dut: BaudGen (
-        i_div: div,
-        o_en ,
-    );
+        initial clk = 0;
+        always #5 clk = ~clk;
 
-    initial {
-        div = '0;
+        initial begin
+            rst_n = 0;
+            i_div = 0;
 
-        for _i in 0..20 {
-            u_clock.next(1);
-            $assert(!o_en);
-        }
+            repeat (5) @(posedge clk);
+            rst_n = 1;
 
-        $finish();
-    }
-}
+            for (int i = 0; i < 20; i++) begin
+                @(posedge clk);
+                if (o_en) $fatal(1, "o_en fired with div=0 at cycle %0d", i);
+            end
+
+            $finish();
+        end
+    endmodule
+}}}

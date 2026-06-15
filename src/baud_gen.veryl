@@ -4,10 +4,10 @@
 // counting 16 enable pulses per bit period.
 // i_div == 0 disables output (no pulses).
 pub module BaudGen (
-    i_clk  : input  clock,
-    i_rst_n: input  reset,
+    i_clk  : input  clock    ,
+    i_rst_n: input  reset    ,
     i_div  : input  logic<16>,
-    o_en   : output logic,
+    o_en   : output logic    ,
 ) {
     var r_counter: logic<16>;
 
