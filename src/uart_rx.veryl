@@ -173,7 +173,19 @@ pub module UartRx (
                                 r_tick       = '0;
                                 fifo_data_in = {!r_smp & r_all_zero, !r_smp, r_par_err, r_shift};
                                 fifo_push    = '1;
-                                r_state      = RxState::Idle;
+                                // Next frame's start bit may already be on the wire
+                                // (back-to-back, zero-gap transmission). Detect it here
+                                // instead of waiting for a separate Idle cycle, so
+                                // per-frame latency stays a constant 160 ticks instead
+                                // of drifting later by 1 tick on every chained frame.
+                                if !i_rxd {
+                                    r_bit_idx  = '0;
+                                    r_parity   = '0;
+                                    r_all_zero = '1;
+                                    r_state    = RxState::Start;
+                                } else {
+                                    r_state = RxState::Idle;
+                                }
                             } else {
                                 r_tick = r_tick + 1;
                             }

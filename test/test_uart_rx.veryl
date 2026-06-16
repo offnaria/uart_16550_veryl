@@ -1,8 +1,11 @@
 // UartRx tests — embedded SystemVerilog testbenches.
 // baud_en tied high so 1 clock = 1 tick, 16 clocks = 1 bit period.
-// Start-bit detection costs 1 extra tick (Idle→Start), so from driving
-// rxd=0 to the DUT entering Data state takes 17 clocks; every subsequent
-// bit (data/parity/stop) takes exactly 16 clocks.
+// Every segment (start/data/parity/stop) is driven for exactly 16 ticks,
+// matching the real bit period — the DUT's Start→Data transition is
+// unconditional on i_rxd, so it doesn't matter that the DUT's own internal
+// bookkeeping takes 17 ticks (1 for Idle's edge detection + 16 for Start's
+// count) to reach the Data state; the wire itself only needs to hold the
+// start bit low for the textbook 16 ticks.
 //
 // o_data layout: {BI, FE, PE, data[7:0]} (bit 10 = BI, bit 9 = FE, bit 8 = PE).
 //
@@ -54,7 +57,7 @@ embed (inline) sv{{{
         // Drive a full frame: start, 8 data bits LSB-first, given stop bit.
         task automatic send_byte(input logic [7:0] d, input logic stop_bit);
             rxd = 0;
-            next(17);
+            next(16);
             for (int i = 0; i < 8; i++) begin
                 rxd = d[i];
                 next(16);
@@ -145,7 +148,7 @@ embed (inline) sv{{{
 
         task automatic send_byte_par(input logic [7:0] d, input logic par_bit, input logic stop_bit);
             rxd = 0;
-            next(17);
+            next(16);
             for (int i = 0; i < 8; i++) begin
                 rxd = d[i];
                 next(16);
@@ -231,7 +234,7 @@ embed (inline) sv{{{
 
         task automatic send_byte(input logic [7:0] d, input logic stop_bit);
             rxd = 0;
-            next(17);
+            next(16);
             for (int i = 0; i < 8; i++) begin
                 rxd = d[i];
                 next(16);
@@ -315,7 +318,7 @@ embed (inline) sv{{{
 
         task automatic send_byte_par(input logic [7:0] d, input logic par_bit, input logic stop_bit);
             rxd = 0;
-            next(17);
+            next(16);
             for (int i = 0; i < 8; i++) begin
                 rxd = d[i];
                 next(16);
@@ -401,7 +404,7 @@ embed (inline) sv{{{
 
         task automatic send_byte(input logic [7:0] d, input logic stop_bit);
             rxd = 0;
-            next(17);
+            next(16);
             for (int i = 0; i < 8; i++) begin
                 rxd = d[i];
                 next(16);
@@ -439,7 +442,10 @@ embed (inline) sv{{{
                 $fatal(1, "Expected FIFO full (16), got %0d", word_count);
 
             // 17th frame must overrun; head data must stay the first byte.
+            // overrun is a 1-cycle pulse that fires 1 tick after send_byte
+            // returns (the Stop state's completion edge), so wait for it.
             send_byte(8'h55, 1'b1);
+            next(1);
             if (!overrun) $fatal(1, "Expected overrun on 17th byte");
 
             next(2);
@@ -447,6 +453,244 @@ embed (inline) sv{{{
                 $fatal(1, "Expected FIFO to stay full at 16, got %0d", word_count);
             if (data !== {3'b0, 8'h11})
                 $fatal(1, "Expected FIFO head unchanged at 0x11, got %b", data);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 6: true back-to-back frames (zero idle gap) ───────────────────────
+// The DUT transitions Stop→Idle only at r_tick==15, the same pulse at which a
+// continuously-transmitting peer's next start bit first appears on the line.
+// Verify no frame is dropped or misaligned when the second frame's start bit
+// is driven on the very same tick the first frame's stop bit ends (no next()
+// call separates the two send_byte calls below).
+#[test(test_uart_rx_back_to_back)]
+embed (inline) sv{{{
+    module test_uart_rx_back_to_back;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        // No trailing rxd=1 settle — caller chains frames with zero gap.
+        task automatic send_byte_no_gap(input logic [7:0] d, input logic stop_bit);
+            rxd = 0;
+            next(16);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = stop_bit;
+            next(16);
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 0;
+            lcr_eps = 0;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // Frame 1's stop bit and frame 2's start bit share no idle gap:
+            // the very next send_byte_no_gap call drives rxd=0 immediately
+            // after frame 1's stop-bit window ends.
+            send_byte_no_gap(8'hC3, 1'b1);
+            send_byte_no_gap(8'h5A, 1'b1);
+            rxd = 1;
+            next(3);
+
+            if (overrun) $fatal(1, "Unexpected overrun on back-to-back frames");
+            if (word_count !== 5'd2)
+                $fatal(1, "Expected 2 frames captured, got %0d", word_count);
+
+            if (data !== {3'b0, 8'hC3})
+                $fatal(1, "Expected first frame=0xC3, got %b", data);
+            pop = 1;
+            next(1);
+            pop = 0;
+            next(2);
+
+            if (data !== {3'b0, 8'h5A})
+                $fatal(1, "Expected second frame=0x5A, got %b", data);
+            pop = 1;
+            next(1);
+            pop = 0;
+            next(1);
+
+            if (!empty) $fatal(1, "Expected FIFO empty after popping both frames");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 7: sustained stream, more frames than the FIFO can hold ──────────
+// Each frame's Idle→Start detection re-samples i_rxd directly off the wire
+// every tick — it is not a free-running counter carried over from the
+// previous frame. So even if there were a fixed 1-tick latency at the
+// Stop→Idle boundary, it could not accumulate across frames: every frame
+// resyncs fresh. Verify this holds over 32 back-to-back zero-gap frames
+// (2x FIFO depth) by draining concurrently with reception and checking
+// every byte arrives in order with no corruption.
+#[test(test_uart_rx_sustained_stream)]
+embed (inline) sv{{{
+    module test_uart_rx_sustained_stream;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        // No trailing rxd=1 settle — caller chains frames with zero gap.
+        task automatic send_byte_no_gap(input logic [7:0] d, input logic stop_bit);
+            rxd = 0;
+            next(16);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = stop_bit;
+            next(16);
+        endtask
+
+        localparam int NUM_FRAMES = 32;
+        logic [7:0] expected [NUM_FRAMES];
+        int         recv_idx;
+        bit         rx_done;
+
+        initial begin
+            rst_n     = 0;
+            baud_en   = 1;
+            rxd       = 1;
+            clear     = 0;
+            pop       = 0;
+            lcr_wls   = 2'd3;
+            lcr_pen   = 0;
+            lcr_eps   = 0;
+            lcr_sp    = 0;
+            recv_idx  = 0;
+            rx_done   = 0;
+
+            for (int i = 0; i < NUM_FRAMES; i++) begin
+                expected[i] = 8'hA5 ^ i[7:0];
+            end
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            fork
+                // Driver: 32 frames back-to-back with zero idle gap throughout.
+                begin
+                    for (int i = 0; i < NUM_FRAMES; i++) begin
+                        send_byte_no_gap(expected[i], 1'b1);
+                    end
+                    rxd = 1;
+                end
+                // Drainer: pops as fast as data is available, checking order.
+                begin
+                    while (recv_idx < NUM_FRAMES) begin
+                        @(posedge clk);
+                        if (overrun)
+                            $fatal(1, "Unexpected overrun during sustained stream");
+                        if (!empty) begin
+                            if (data !== {3'b0, expected[recv_idx]})
+                                $fatal(1, "Frame %0d: expected %02x, got %b",
+                                       recv_idx, expected[recv_idx], data);
+                            pop = 1;
+                            recv_idx++;
+                        end else begin
+                            pop = 0;
+                        end
+                    end
+                    // One more edge so the final pop=1 (set on the last
+                    // iteration above) is actually sampled before clearing it.
+                    @(posedge clk);
+                    pop     = 0;
+                    rx_done = 1;
+                end
+            join
+
+            next(3);
+            if (!empty) $fatal(1, "Expected FIFO empty after draining sustained stream");
+            if (recv_idx != NUM_FRAMES)
+                $fatal(1, "Expected %0d frames received, got %0d", NUM_FRAMES, recv_idx);
 
             $finish();
         end
