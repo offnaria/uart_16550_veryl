@@ -1,0 +1,454 @@
+// UartRx tests — embedded SystemVerilog testbenches.
+// baud_en tied high so 1 clock = 1 tick, 16 clocks = 1 bit period.
+// Start-bit detection costs 1 extra tick (Idle→Start), so from driving
+// rxd=0 to the DUT entering Data state takes 17 clocks; every subsequent
+// bit (data/parity/stop) takes exactly 16 clocks.
+//
+// o_data layout: {BI, FE, PE, data[7:0]} (bit 10 = BI, bit 9 = FE, bit 8 = PE).
+//
+// Reset: 5 cycles, then 3 settle clocks for FIFO FLAG_FF_OUT to initialise.
+
+// ─── Test 1: 8N1 — receive 0xA5, verify decoded byte and flags ─────────────
+#[test(test_uart_rx_8n1)]
+embed (inline) sv{{{
+    module test_uart_rx_8n1;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        // Drive a full frame: start, 8 data bits LSB-first, given stop bit.
+        task automatic send_byte(input logic [7:0] d, input logic stop_bit);
+            rxd = 0;
+            next(17);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = stop_bit;
+            next(16);
+            rxd = 1;
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 0;
+            lcr_eps = 0;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            send_byte(8'hA5, 1'b1);
+            next(3); // FLAG_FF_OUT/DATA_FF_OUT latency
+
+            if (empty) $fatal(1, "Expected o_empty=0 after frame");
+            if (data !== {1'b0, 1'b0, 1'b0, 8'hA5})
+                $fatal(1, "Expected data=0xA5 BI/FE/PE=0, got %b", data);
+            if (overrun) $fatal(1, "Unexpected overrun");
+
+            pop = 1;
+            next(1);
+            pop = 0;
+            next(1);
+            if (!empty) $fatal(1, "Expected o_empty=1 after pop");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 2: parity error (8E1) ──────────────────────────────────────────────
+// LCR: WLS=11, PEN=1, EPS=1 (even). 0x01 → 1 one → correct even parity = 1.
+// Drive parity bit = 0 (wrong) → PE expected.
+#[test(test_uart_rx_parity_error)]
+embed (inline) sv{{{
+    module test_uart_rx_parity_error;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic send_byte_par(input logic [7:0] d, input logic par_bit, input logic stop_bit);
+            rxd = 0;
+            next(17);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = par_bit;
+            next(16);
+            rxd = stop_bit;
+            next(16);
+            rxd = 1;
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 1;
+            lcr_eps = 1;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            send_byte_par(8'h01, 1'b0, 1'b1); // wrong parity: should be 1
+            next(3);
+
+            if (empty) $fatal(1, "Expected o_empty=0 after frame");
+            if (data !== {1'b0, 1'b0, 1'b1, 8'h01})
+                $fatal(1, "Expected data=0x01 PE=1, BI/FE=0, got %b", data);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 3: framing error ───────────────────────────────────────────────────
+// LCR: WLS=11, PEN=0. Send 0xA5 with stop bit = 0 (should be 1) → FE.
+// 0xA5 has set bits, so BI must stay 0 despite the framing error.
+#[test(test_uart_rx_framing_error)]
+embed (inline) sv{{{
+    module test_uart_rx_framing_error;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic send_byte(input logic [7:0] d, input logic stop_bit);
+            rxd = 0;
+            next(17);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = stop_bit;
+            next(16);
+            rxd = 1;
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 0;
+            lcr_eps = 0;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            send_byte(8'hA5, 1'b0); // bad stop bit
+            next(3);
+
+            if (empty) $fatal(1, "Expected o_empty=0 after frame");
+            if (data !== {1'b0, 1'b1, 1'b0, 8'hA5})
+                $fatal(1, "Expected data=0xA5 FE=1, BI/PE=0, got %b", data);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 4: break interrupt ─────────────────────────────────────────────────
+// LCR: WLS=11, PEN=1, EPS=1. Data=0x00, parity bit=0, stop bit=0 →
+// every received bit is 0 → BI=1 (and FE=1, PE=0 since 0x00 even parity is 0).
+#[test(test_uart_rx_break)]
+embed (inline) sv{{{
+    module test_uart_rx_break;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic send_byte_par(input logic [7:0] d, input logic par_bit, input logic stop_bit);
+            rxd = 0;
+            next(17);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = par_bit;
+            next(16);
+            rxd = stop_bit;
+            next(16);
+            rxd = 1;
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 1;
+            lcr_eps = 1;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            send_byte_par(8'h00, 1'b0, 1'b0); // all-zero frame, incl. stop
+            next(3);
+
+            if (empty) $fatal(1, "Expected o_empty=0 after frame");
+            if (data !== {1'b1, 1'b1, 1'b0, 8'h00})
+                $fatal(1, "Expected data=0x00 BI=1 FE=1 PE=0, got %b", data);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 5: overrun ─────────────────────────────────────────────────────────
+// Fill the 16-entry RX FIFO without popping, then send one more byte.
+// The 17th push must be dropped (FIFO data unchanged) and o_overrun must pulse.
+#[test(test_uart_rx_overrun)]
+embed (inline) sv{{{
+    module test_uart_rx_overrun;
+        logic        clk;
+        logic        rst_n;
+        logic        baud_en;
+        logic        rxd;
+        logic        clear;
+        logic        pop;
+        logic [1:0]  lcr_wls;
+        logic        lcr_pen;
+        logic        lcr_eps;
+        logic        lcr_sp;
+        logic [10:0] data;
+        logic        empty;
+        logic [4:0]  word_count;
+        logic        overrun;
+
+        uart_16550_veryl_UartRx u_dut (
+            .i_clk       (clk       ),
+            .i_rst_n     (rst_n     ),
+            .i_baud_en   (baud_en   ),
+            .i_rxd       (rxd       ),
+            .i_clear     (clear     ),
+            .i_pop       (pop       ),
+            .i_lcr_wls   (lcr_wls   ),
+            .i_lcr_pen   (lcr_pen   ),
+            .i_lcr_eps   (lcr_eps   ),
+            .i_lcr_sp    (lcr_sp    ),
+            .o_data      (data      ),
+            .o_empty     (empty     ),
+            .o_word_count(word_count),
+            .o_overrun   (overrun   )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic send_byte(input logic [7:0] d, input logic stop_bit);
+            rxd = 0;
+            next(17);
+            for (int i = 0; i < 8; i++) begin
+                rxd = d[i];
+                next(16);
+            end
+            rxd = stop_bit;
+            next(16);
+            rxd = 1;
+        endtask
+
+        initial begin
+            rst_n   = 0;
+            baud_en = 1;
+            rxd     = 1;
+            clear   = 0;
+            pop     = 0;
+            lcr_wls = 2'd3;
+            lcr_pen = 0;
+            lcr_eps = 0;
+            lcr_sp  = 0;
+
+            next(5);
+            rst_n = 1;
+            next(3);
+
+            // Fill the FIFO: 16 frames, no pop.
+            for (int i = 0; i < 16; i++) begin
+                logic [7:0] byte_val;
+                byte_val = 8'h11 + i[7:0];
+                send_byte(byte_val, 1'b1);
+                next(2);
+                if (overrun) $fatal(1, "Unexpected overrun at frame %0d", i);
+            end
+
+            if (word_count !== 5'd16)
+                $fatal(1, "Expected FIFO full (16), got %0d", word_count);
+
+            // 17th frame must overrun; head data must stay the first byte.
+            send_byte(8'h55, 1'b1);
+            if (!overrun) $fatal(1, "Expected overrun on 17th byte");
+
+            next(2);
+            if (word_count !== 5'd16)
+                $fatal(1, "Expected FIFO to stay full at 16, got %0d", word_count);
+            if (data !== {3'b0, 8'h11})
+                $fatal(1, "Expected FIFO head unchanged at 0x11, got %b", data);
+
+            $finish();
+        end
+    endmodule
+}}}
