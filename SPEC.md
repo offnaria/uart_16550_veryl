@@ -14,7 +14,7 @@
 | `i_rst_n` | in | reset | Synchronous active-low reset |
 | `i_axi_awvalid` | in | 1 | AXI write address valid |
 | `o_axi_awready` | out | 1 | AXI write address ready |
-| `i_axi_awaddr` | in | 32 | AXI write address |
+| `i_axi_awaddr` | in | 5 | AXI write address |
 | `i_axi_awprot` | in | 3 | AXI write protection (ignored) |
 | `i_axi_wvalid` | in | 1 | AXI write data valid |
 | `o_axi_wready` | out | 1 | AXI write data ready |
@@ -25,7 +25,7 @@
 | `o_axi_bresp` | out | 2 | AXI write response (always OKAY=00) |
 | `i_axi_arvalid` | in | 1 | AXI read address valid |
 | `o_axi_arready` | out | 1 | AXI read address ready |
-| `i_axi_araddr` | in | 32 | AXI read address |
+| `i_axi_araddr` | in | 5 | AXI read address |
 | `i_axi_arprot` | in | 3 | AXI read protection (ignored) |
 | `o_axi_rvalid` | out | 1 | AXI read data valid |
 | `i_axi_rready` | in | 1 | AXI read data ready |

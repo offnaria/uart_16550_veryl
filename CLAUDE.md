@@ -65,18 +65,20 @@ Each module has a dedicated test file in `test/`. Write and run its test before 
 | `test/test_baud_gen.veryl` | `BaudGen` | `o_en` pulse period matches `divisor × 16` clocks; divisor change takes effect immediately |
 | `test/test_uart_tx.veryl` | `UartTx` | Correct bit stream on `o_txd`: start=0, data LSB-first, parity (if enabled), stop=1; `o_idle` and `o_fifo_full` timing |
 | `test/test_uart_rx.veryl` | `UartRx` | Valid frame → correct data + no errors; framing error; parity error; overrun when FIFO full |
+| `test/test_uart_regs.veryl` | `UartRegs` | AXI handshake (AW/W same-cycle accept, BRESP/RDATA next-cycle); DLAB gates DLL/DLM vs RBR/THR/IER; FCR RXRST/TXRST pulse decode; RBR/LSR/MSR read strobes fire on the correct offset |
 | `test/test_uart_16550.veryl` | `Uart16550` | AXI write DLL/DLM + LCR; AXI write THR → verify TX bitstream; drive RXD → AXI read RBR; loopback mode; interrupt assertion/deassertion |
 
 ## Development Plan
 
-Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed). Implementation is split into four source files built bottom-up. **Each step includes writing and passing the corresponding test before proceeding.**
+Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed). Implementation is split into five source files built bottom-up. **Each step includes writing and passing the corresponding test before proceeding.**
 
 | Step | Src file | Test file | Status |
 |---|---|---|---|
 | 1 | `src/baud_gen.veryl` | `test/test_baud_gen.veryl` | ✅ done |
 | 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | ✅ done |
 | 3 | `src/uart_rx.veryl` | `test/test_uart_rx.veryl` | ✅ done |
-| 4 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
+| 4 | `src/uart_regs.veryl` | `test/test_uart_regs.veryl` | 🔲 pending |
+| 5 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
 
 ### `$std::fifo` usage
 - TX FIFO: `$std::fifo #(WIDTH: 8, DEPTH: 16)` — `i_clear` maps to FCR.TXRST
@@ -104,10 +106,39 @@ TX shift register driven by `BaudGen`'s 16× enable.
 - Writes `{BI, FE, PE, data[7:0]}` into RX FIFO; signals OE when FIFO full.
 - Word length, parity configured via LCR fields passed as ports.
 
-### Step 4 — `Uart16550` (top level)
-AXI4-Lite slave + register file + interrupt logic + loopback.
+### Step 4 — `UartRegs`
+AXI4-Lite slave + register storage/decode, with no UART semantics of its own. All
+status computation (LSR/MSR bit assembly, OE/DCTS sticky bits, interrupt priority
+encoder) lives in `Uart16550` and is just muxed through here on read.
+- Port list stays flat (`i_axi_awvalid`, `o_axi_awready`, ... per `SPEC.md`), matching
+  every other module in this project — keeps `test/test_uart_regs.veryl` a plain
+  embedded-SV testbench like the rest, with no SV `interface`/modport plumbing needed
+  on the test side.
+- Internally, instantiate `$std::axi4_lite_if::<$std::axi4_lite_pkg::<5, 4, 1>>` and
+  bridge the flat ports to its signals with `assign`s (tie `awid`/`bid`/`arid`/`rid` to
+  `1'b0`/`'0` — this project doesn't use AXI IDs). `ADDR_W=5` matches `i_axi_awaddr`/
+  `i_axi_araddr`'s width per `SPEC.md` (enough for the register map's `0x00`–`0x1C`
+  offsets), so they connect straight through to `u_axi.awaddr`/`u_axi.araddr` with no
+  slicing needed. Use the interface's
+  `awaddr_ack()`/`wdata_ack()`/`bresp_ack()`/`araddr_ack()`/`rdata_ack()` functions in
+  the handshake FSM instead of hand-rolling `valid && ready` everywhere.
 - AW/W accepted simultaneously; BRESP next cycle; AR→RDATA next cycle.
 - Register decode: offset bits `[4:2]` select register; DLAB gates DLL/DLM vs RBR/THR/IER.
-- Side effects on read: RBR advances RX FIFO, LSR clears OE, MSR clears DCTS.
-- Interrupt priority encoder feeds IIR; `o_intr = MCR.OUT2 & any_pending`.
-- Loopback: TX output → RX input, RTS → CTS; physical pins held inactive.
+- Stores DLL, DLM, IER, LCR, MCR, SCR, and FCR's 2-bit RXTRIG field; exposes them as
+  plain output ports for `BaudGen`/`UartTx`/`UartRx`/`Uart16550` to consume.
+- FCR write decodes to 1-cycle `o_fcr_rxrst`/`o_fcr_txrst` pulses (not stored).
+- THR write → `o_thr_push` + `o_thr_data` pass-through (no local TX FIFO).
+- RBR/LSR/MSR/IIR reads mux in `i_rbr_data`/`i_lsr`/`i_msr`/`i_iir` input ports;
+  RBR and LSR and MSR reads each emit a 1-cycle strobe (`o_rbr_pop`, `o_lsr_rd`,
+  `o_msr_rd`) so `Uart16550` can pop the RX FIFO / clear OE / clear DCTS.
+
+### Step 5 — `Uart16550` (top level)
+Instantiates `BaudGen`, `UartTx`, `UartRx`, `UartRegs` and wires them together;
+owns interrupt logic and loopback.
+- Builds live LSR (DR/PE/FE/BI/THRE/TEMT/FIFOERR from FIFO+shift-register status,
+  OE as a sticky bit cleared by `UartRegs`'s `o_lsr_rd`) and MSR (CTS level, DCTS
+  sticky bit cleared by `o_msr_rd`) vectors, fed into `UartRegs` as `i_lsr`/`i_msr`.
+- Interrupt priority encoder (LSR errors → RDA/timeout → THRE → MSR) feeds IIR,
+  fed into `UartRegs` as `i_iir`; `o_intr = MCR.OUT2 & any_pending`.
+- Loopback (MCR.LOOP=1): TX shift output → RX input, RTS → CTS; physical
+  `o_uart_txd`/`o_uart_rts` pins held inactive.
