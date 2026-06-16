@@ -83,7 +83,7 @@ embed (inline) sv{{{
             next(3);
 
             send_byte(8'hA5, 1'b1);
-            next(3); // FLAG_FF_OUT/DATA_FF_OUT latency
+            next(5); // FLAG_FF_OUT/DATA_FF_OUT latency
 
             if (empty) $fatal(1, "Expected o_empty=0 after frame");
             if (data !== {1'b0, 1'b0, 1'b0, 8'hA5})
@@ -176,7 +176,7 @@ embed (inline) sv{{{
             next(3);
 
             send_byte_par(8'h01, 1'b0, 1'b1); // wrong parity: should be 1
-            next(3);
+            next(5);
 
             if (empty) $fatal(1, "Expected o_empty=0 after frame");
             if (data !== {1'b0, 1'b0, 1'b1, 8'h01})
@@ -260,7 +260,7 @@ embed (inline) sv{{{
             next(3);
 
             send_byte(8'hA5, 1'b0); // bad stop bit
-            next(3);
+            next(5);
 
             if (empty) $fatal(1, "Expected o_empty=0 after frame");
             if (data !== {1'b0, 1'b1, 1'b0, 8'hA5})
@@ -346,7 +346,7 @@ embed (inline) sv{{{
             next(3);
 
             send_byte_par(8'h00, 1'b0, 1'b0); // all-zero frame, incl. stop
-            next(3);
+            next(5);
 
             if (empty) $fatal(1, "Expected o_empty=0 after frame");
             if (data !== {1'b1, 1'b1, 1'b0, 8'h00})
@@ -434,7 +434,7 @@ embed (inline) sv{{{
                 logic [7:0] byte_val;
                 byte_val = 8'h11 + i[7:0];
                 send_byte(byte_val, 1'b1);
-                next(2);
+                next(4);
                 if (overrun) $fatal(1, "Unexpected overrun at frame %0d", i);
             end
 
@@ -442,10 +442,11 @@ embed (inline) sv{{{
                 $fatal(1, "Expected FIFO full (16), got %0d", word_count);
 
             // 17th frame must overrun; head data must stay the first byte.
-            // overrun is a 1-cycle pulse that fires 1 tick after send_byte
-            // returns (the Stop state's completion edge), so wait for it.
+            // overrun is a 1-cycle pulse that fires a few ticks after
+            // send_byte returns (Stop's completion edge, plus the 2-tick
+            // i_rxd synchronizer latency), so wait for it.
             send_byte(8'h55, 1'b1);
-            next(1);
+            next(3);
             if (!overrun) $fatal(1, "Expected overrun on 17th byte");
 
             next(2);
@@ -540,7 +541,7 @@ embed (inline) sv{{{
             send_byte_no_gap(8'hC3, 1'b1);
             send_byte_no_gap(8'h5A, 1'b1);
             rxd = 1;
-            next(3);
+            next(5);
 
             if (overrun) $fatal(1, "Unexpected overrun on back-to-back frames");
             if (word_count !== 5'd2)
