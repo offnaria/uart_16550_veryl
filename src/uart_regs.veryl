@@ -1,0 +1,239 @@
+// AXI4-Lite slave + register storage/decode for the UART 16550 register map.
+// No UART semantics live here: LSR/MSR/IIR are computed by Uart16550 and just
+// muxed through on read; this module only knows the register map and DLAB gating.
+pub module UartRegs (
+    i_clk  : input clock,
+    i_rst_n: input reset,
+    // AXI4-Lite slave (5-bit address covers the 0x00-0x1C register map)
+    i_axi_awvalid: input  logic    ,
+    o_axi_awready: output logic    ,
+    i_axi_awaddr : input  logic<5> ,
+    i_axi_awprot : input  logic<3> ,
+    i_axi_wvalid : input  logic    ,
+    o_axi_wready : output logic    ,
+    i_axi_wdata  : input  logic<32>,
+    i_axi_wstrb  : input  logic<4> ,
+    o_axi_bvalid : output logic    ,
+    i_axi_bready : input  logic    ,
+    o_axi_bresp  : output logic<2> ,
+    i_axi_arvalid: input  logic    ,
+    o_axi_arready: output logic    ,
+    i_axi_araddr : input  logic<5> ,
+    i_axi_arprot : input  logic<3> ,
+    o_axi_rvalid : output logic    ,
+    i_axi_rready : input  logic    ,
+    o_axi_rdata  : output logic<32>,
+    o_axi_rresp  : output logic<2> ,
+    // Stored register outputs, consumed by BaudGen/UartTx/UartRx/Uart16550
+    o_dll       : output logic<8>,
+    o_dlm       : output logic<8>,
+    o_ier       : output logic<8>,
+    o_lcr       : output logic<8>,
+    o_mcr       : output logic<8>,
+    o_scr       : output logic<8>,
+    o_fcr_rxtrig: output logic<2>,
+    o_fcr_rxrst : output logic   ,
+    o_fcr_txrst : output logic   ,
+    // THR write pass-through (no local TX FIFO)
+    o_thr_push: output logic   ,
+    o_thr_data: output logic<8>,
+    // RBR read pass-through
+    i_rbr_data: input  logic<8>,
+    o_rbr_pop : output logic   ,
+    // LSR/MSR/IIR: computed in Uart16550, muxed in here on read
+    i_lsr   : input  logic<8>,
+    o_lsr_rd: output logic   ,
+    i_msr   : input  logic<8>,
+    o_msr_rd: output logic   ,
+    i_iir   : input  logic<8>,
+) {
+    // No pipelining: only accept a new AR once the previous RDATA has been
+    // consumed. AW/W are only ever accepted together: awready/wready each
+    // wait for the *other* channel's valid too, so a master that asserts
+    // AWVALID and WVALID in different cycles still gets both accepted in
+    // the same cycle instead of having its address silently dropped.
+    var w_awready: logic;
+    var w_wready : logic;
+    var w_arready: logic;
+
+    var r_bvalid: logic    ;
+    var r_bresp : logic<2> ;
+    var r_rvalid: logic    ;
+    var r_rdata : logic<32>;
+    var r_rresp : logic<2> ;
+
+    assign w_awready = i_axi_wvalid && !r_bvalid;
+    assign w_wready  = i_axi_awvalid && !r_bvalid;
+    assign w_arready = !r_rvalid;
+
+    var w_wr_ack: logic;
+    var w_ar_ack: logic;
+    assign w_wr_ack = i_axi_awvalid && i_axi_wvalid && !r_bvalid && i_axi_wstrb[0];
+    assign w_ar_ack = i_axi_arvalid && !r_rvalid;
+
+    // Offset bits [4:2] select one of the 8 word-aligned registers.
+    var w_wr_sel: logic<3>;
+    var w_rd_sel: logic<3>;
+    assign w_wr_sel = i_axi_awaddr[4:2];
+    assign w_rd_sel = i_axi_araddr[4:2];
+
+    var r_dll       : logic<8>;
+    var r_dlm       : logic<8>;
+    var r_ier       : logic<8>;
+    var r_lcr       : logic<8>;
+    var r_mcr       : logic<8>;
+    var r_scr       : logic<8>;
+    var r_fcr_rxtrig: logic<2>;
+    var r_fcr_rxrst : logic   ;
+    var r_fcr_txrst : logic   ;
+    var r_thr_push  : logic   ;
+    var r_thr_data  : logic<8>;
+    var r_rbr_pop   : logic   ;
+    var r_lsr_rd    : logic   ;
+    var r_msr_rd    : logic   ;
+
+    var w_dlab: logic;
+    assign w_dlab = r_lcr[7];
+
+    always_ff {
+        if_reset {
+            r_bvalid = '0;
+            r_bresp  = 2'b00;
+            r_rvalid = '0;
+            r_rdata  = '0;
+            r_rresp  = 2'b00;
+
+            r_dll        = '0;
+            r_dlm        = '0;
+            r_ier        = '0;
+            r_lcr        = '0;
+            r_mcr        = '0;
+            r_scr        = '0;
+            r_fcr_rxtrig = '0;
+            r_fcr_rxrst  = '0;
+            r_fcr_txrst  = '0;
+            r_thr_push   = '0;
+            r_thr_data   = '0;
+            r_rbr_pop    = '0;
+            r_lsr_rd     = '0;
+            r_msr_rd     = '0;
+        } else {
+            r_fcr_rxrst = '0;
+            r_fcr_txrst = '0;
+            r_thr_push  = '0;
+            r_rbr_pop   = '0;
+            r_lsr_rd    = '0;
+            r_msr_rd    = '0;
+
+            // Write channel: decode + side effects, BRESP next cycle.
+            if w_wr_ack {
+                case w_wr_sel {
+                    3'd0: {
+                        if w_dlab {
+                            r_dll = i_axi_wdata[7:0];
+                        } else {
+                            r_thr_push = '1;
+                            r_thr_data = i_axi_wdata[7:0];
+                        }
+                    }
+                    3'd1: {
+                        if w_dlab {
+                            r_dlm = i_axi_wdata[7:0];
+                        } else {
+                            r_ier = {4'b0, i_axi_wdata[3:0]};
+                        }
+                    }
+                    3'd2: {
+                        // FCR: RXRST/TXRST are self-clearing pulses, not stored.
+                        r_fcr_rxrst  = i_axi_wdata[1];
+                        r_fcr_txrst  = i_axi_wdata[2];
+                        r_fcr_rxtrig = i_axi_wdata[7:6];
+                    }
+                    3'd3: {
+                        r_lcr = i_axi_wdata[7:0];
+                    }
+                    3'd4: {
+                        r_mcr = {3'b0, i_axi_wdata[4:0]};
+                    }
+                    3'd7: {
+                        r_scr = i_axi_wdata[7:0];
+                    }
+                    default: {}
+                }
+                r_bvalid = '1;
+                r_bresp  = 2'b00;
+            } else if i_axi_bready && r_bvalid {
+                r_bvalid = '0;
+            }
+
+            // Read channel: decode + side effects, RDATA/RVALID next cycle.
+            if w_ar_ack {
+                case w_rd_sel {
+                    3'd0: {
+                        if w_dlab {
+                            r_rdata = {24'b0, r_dll};
+                        } else {
+                            r_rdata   = {24'b0, i_rbr_data};
+                            r_rbr_pop = '1;
+                        }
+                    }
+                    3'd1: {
+                        if w_dlab {
+                            r_rdata = {24'b0, r_dlm};
+                        } else {
+                            r_rdata = {24'b0, r_ier};
+                        }
+                    }
+                    3'd2: {
+                        r_rdata = {24'b0, i_iir};
+                    }
+                    3'd3: {
+                        r_rdata = {24'b0, r_lcr};
+                    }
+                    3'd4: {
+                        r_rdata = {24'b0, r_mcr};
+                    }
+                    3'd5: {
+                        r_rdata  = {24'b0, i_lsr};
+                        r_lsr_rd = '1;
+                    }
+                    3'd6: {
+                        r_rdata  = {24'b0, i_msr};
+                        r_msr_rd = '1;
+                    }
+                    3'd7: {
+                        r_rdata = {24'b0, r_scr};
+                    }
+                }
+                r_rvalid = '1;
+                r_rresp  = 2'b00;
+            } else if i_axi_rready && r_rvalid {
+                r_rvalid = '0;
+            }
+        }
+    }
+
+    assign o_axi_awready = w_awready;
+    assign o_axi_wready  = w_wready;
+    assign o_axi_bvalid  = r_bvalid;
+    assign o_axi_bresp   = r_bresp;
+    assign o_axi_arready = w_arready;
+    assign o_axi_rvalid  = r_rvalid;
+    assign o_axi_rdata   = r_rdata;
+    assign o_axi_rresp   = r_rresp;
+
+    assign o_dll        = r_dll;
+    assign o_dlm        = r_dlm;
+    assign o_ier        = r_ier;
+    assign o_lcr        = r_lcr;
+    assign o_mcr        = r_mcr;
+    assign o_scr        = r_scr;
+    assign o_fcr_rxtrig = r_fcr_rxtrig;
+    assign o_fcr_rxrst  = r_fcr_rxrst;
+    assign o_fcr_txrst  = r_fcr_txrst;
+    assign o_thr_push   = r_thr_push;
+    assign o_thr_data   = r_thr_data;
+    assign o_rbr_pop    = r_rbr_pop;
+    assign o_lsr_rd     = r_lsr_rd;
+    assign o_msr_rd     = r_msr_rd;
+}

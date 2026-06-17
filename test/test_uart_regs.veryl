@@ -1,0 +1,668 @@
+// UartRegs tests — embedded SystemVerilog testbenches.
+// Clock period = 10 ns. No baud-rate dependency: this module is pure
+// AXI4-Lite + register storage/decode.
+
+// ─── Test 1: AXI4-Lite handshake timing ─────────────────────────────────────
+// AW/W accepted in the same cycle even when AWVALID/WVALID are asserted in
+// different cycles (the slave waits for both before asserting either ready,
+// so a master never sees its address/data transfer "complete" before the
+// other channel is presented); BRESP asserted the cycle after; AR accepted
+// in one cycle; RDATA/RVALID asserted the cycle after.
+#[test(test_uart_regs_axi_handshake)]
+embed (inline) sv{{{
+    module test_uart_regs_axi_handshake;
+        logic        clk, rst_n;
+        logic        awvalid, awready;
+        logic [4:0]  awaddr;
+        logic [2:0]  awprot;
+        logic        wvalid, wready;
+        logic [31:0] wdata;
+        logic [3:0]  wstrb;
+        logic        bvalid, bready;
+        logic [1:0]  bresp;
+        logic        arvalid, arready;
+        logic [4:0]  araddr;
+        logic [2:0]  arprot;
+        logic        rvalid, rready;
+        logic [31:0] rdata;
+        logic [1:0]  rresp;
+        logic [7:0]  dll, dlm, ier, lcr, mcr, scr;
+        logic [1:0]  fcr_rxtrig;
+        logic        fcr_rxrst, fcr_txrst;
+        logic        thr_push;
+        logic [7:0]  thr_data;
+        logic [7:0]  rbr_data;
+        logic        rbr_pop;
+        logic [7:0]  lsr, msr, iir;
+        logic        lsr_rd, msr_rd;
+
+        uart_16550_veryl_UartRegs u_dut (
+            .i_clk        (clk       ),
+            .i_rst_n      (rst_n     ),
+            .i_axi_awvalid(awvalid   ),
+            .o_axi_awready(awready   ),
+            .i_axi_awaddr (awaddr    ),
+            .i_axi_awprot (awprot    ),
+            .i_axi_wvalid (wvalid    ),
+            .o_axi_wready (wready    ),
+            .i_axi_wdata  (wdata     ),
+            .i_axi_wstrb  (wstrb     ),
+            .o_axi_bvalid (bvalid    ),
+            .i_axi_bready (bready    ),
+            .o_axi_bresp  (bresp     ),
+            .i_axi_arvalid(arvalid   ),
+            .o_axi_arready(arready   ),
+            .i_axi_araddr (araddr    ),
+            .i_axi_arprot (arprot    ),
+            .o_axi_rvalid (rvalid    ),
+            .i_axi_rready (rready    ),
+            .o_axi_rdata  (rdata     ),
+            .o_axi_rresp  (rresp     ),
+            .o_dll        (dll       ),
+            .o_dlm        (dlm       ),
+            .o_ier        (ier       ),
+            .o_lcr        (lcr       ),
+            .o_mcr        (mcr       ),
+            .o_scr        (scr       ),
+            .o_fcr_rxtrig (fcr_rxtrig),
+            .o_fcr_rxrst  (fcr_rxrst ),
+            .o_fcr_txrst  (fcr_txrst ),
+            .o_thr_push   (thr_push  ),
+            .o_thr_data   (thr_data  ),
+            .i_rbr_data   (rbr_data  ),
+            .o_rbr_pop    (rbr_pop   ),
+            .i_lsr        (lsr       ),
+            .o_lsr_rd     (lsr_rd    ),
+            .i_msr        (msr       ),
+            .o_msr_rd     (msr_rd    ),
+            .i_iir        (iir       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        initial begin
+            rst_n    = 0;
+            awvalid  = 0; awaddr = 0; awprot = 0;
+            wvalid   = 0; wdata  = 0; wstrb  = 0;
+            bready   = 0;
+            arvalid  = 0; araddr = 0; arprot = 0;
+            rready   = 0;
+            rbr_data = 0;
+            lsr      = 0;
+            msr      = 0;
+            iir      = 0;
+
+            next(5);
+            rst_n = 1;
+            next(2);
+
+            if (awready)  $fatal(1, "Expected awready=0 when idle (WVALID not yet presented)");
+            if (wready)   $fatal(1, "Expected wready=0 when idle (AWVALID not yet presented)");
+            if (!arready) $fatal(1, "Expected arready=1 when idle");
+
+            // ── Scenario A: AWVALID presented several cycles before WVALID.
+            // The slave must not assert AWREADY until WVALID also appears;
+            // verified by checking no write completes while only one channel
+            // is valid, then confirming it completes correctly once both are.
+            awaddr  = 5'h0C; // LCR
+            awvalid = 1;
+            bready  = 1;
+            next(1);
+            if (awready) $fatal(1, "Expected awready=0 while WVALID has not yet appeared");
+
+            next(2); // master keeps holding AWVALID
+            if (awready) $fatal(1, "Expected awready to stay 0 until WVALID appears");
+            if (bvalid)  $fatal(1, "Expected no write before WVALID appears");
+
+            // Now present WVALID too; write should complete in this clock cycle.
+            wdata  = 32'h00000047;
+            wstrb  = 4'hF;
+            wvalid = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+
+            if (!bvalid) $fatal(1, "Expected bvalid asserted the cycle after AW/W accept");
+            if (bresp !== 2'b00) $fatal(1, "Expected BRESP=OKAY, got %b", bresp);
+            if (lcr !== 8'h47) $fatal(1, "Expected LCR=0x47 after write, got %h", lcr);
+
+            next(1);
+            if (bvalid) $fatal(1, "Expected bvalid to clear after BRESP consumed");
+            bready = 0;
+
+            // ── Scenario B: WVALID presented several cycles before AWVALID
+            // (the symmetric case). ────────────────────────────────────
+            wdata  = 32'h00000099;
+            wstrb  = 4'hF;
+            wvalid = 1;
+            bready = 1;
+            next(1);
+            if (wready) $fatal(1, "Expected wready=0 while AWVALID has not yet appeared");
+
+            next(2); // master keeps holding WVALID
+            if (wready) $fatal(1, "Expected wready to stay 0 until AWVALID appears");
+            if (bvalid) $fatal(1, "Expected no write before AWVALID appears");
+
+            // Now present AWVALID too; write should complete in this clock cycle.
+            awaddr  = 5'h1C; // SCR
+            awvalid = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+
+            if (!bvalid) $fatal(1, "Expected bvalid asserted the cycle after AW/W accept");
+            if (scr !== 8'h99) $fatal(1, "Expected SCR=0x99 after write, got %h", scr);
+
+            next(1);
+            if (bvalid) $fatal(1, "Expected bvalid to clear after BRESP consumed");
+            bready = 0;
+
+            // ── AR accepted, RDATA next cycle ─────────────────────────
+            araddr  = 5'h0C; // LCR
+            arvalid = 1;
+            rready  = 1;
+            if (!arready) $fatal(1, "Expected arready=1 when presenting AR");
+            next(1);
+            arvalid = 0;
+
+            if (!rvalid) $fatal(1, "Expected rvalid asserted the cycle after AR accept");
+            if (rdata !== 32'h00000047)
+                $fatal(1, "Expected RDATA=0x47 reading LCR back, got %h", rdata);
+            if (rresp !== 2'b00) $fatal(1, "Expected RRESP=OKAY, got %b", rresp);
+
+            next(1);
+            if (rvalid) $fatal(1, "Expected rvalid to clear after RDATA consumed");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 2: DLAB gates DLL/DLM vs RBR/THR/IER ──────────────────────────────
+#[test(test_uart_regs_dlab_gating)]
+embed (inline) sv{{{
+    module test_uart_regs_dlab_gating;
+        logic        clk, rst_n;
+        logic        awvalid, awready;
+        logic [4:0]  awaddr;
+        logic [2:0]  awprot;
+        logic        wvalid, wready;
+        logic [31:0] wdata;
+        logic [3:0]  wstrb;
+        logic        bvalid, bready;
+        logic [1:0]  bresp;
+        logic        arvalid, arready;
+        logic [4:0]  araddr;
+        logic [2:0]  arprot;
+        logic        rvalid, rready;
+        logic [31:0] rdata;
+        logic [1:0]  rresp;
+        logic [7:0]  dll, dlm, ier, lcr, mcr, scr;
+        logic [1:0]  fcr_rxtrig;
+        logic        fcr_rxrst, fcr_txrst;
+        logic        thr_push;
+        logic [7:0]  thr_data;
+        logic [7:0]  rbr_data;
+        logic        rbr_pop;
+        logic [7:0]  lsr, msr, iir;
+        logic        lsr_rd, msr_rd;
+
+        uart_16550_veryl_UartRegs u_dut (
+            .i_clk        (clk       ),
+            .i_rst_n      (rst_n     ),
+            .i_axi_awvalid(awvalid   ),
+            .o_axi_awready(awready   ),
+            .i_axi_awaddr (awaddr    ),
+            .i_axi_awprot (awprot    ),
+            .i_axi_wvalid (wvalid    ),
+            .o_axi_wready (wready    ),
+            .i_axi_wdata  (wdata     ),
+            .i_axi_wstrb  (wstrb     ),
+            .o_axi_bvalid (bvalid    ),
+            .i_axi_bready (bready    ),
+            .o_axi_bresp  (bresp     ),
+            .i_axi_arvalid(arvalid   ),
+            .o_axi_arready(arready   ),
+            .i_axi_araddr (araddr    ),
+            .i_axi_arprot (arprot    ),
+            .o_axi_rvalid (rvalid    ),
+            .i_axi_rready (rready    ),
+            .o_axi_rdata  (rdata     ),
+            .o_axi_rresp  (rresp     ),
+            .o_dll        (dll       ),
+            .o_dlm        (dlm       ),
+            .o_ier        (ier       ),
+            .o_lcr        (lcr       ),
+            .o_mcr        (mcr       ),
+            .o_scr        (scr       ),
+            .o_fcr_rxtrig (fcr_rxtrig),
+            .o_fcr_rxrst  (fcr_rxrst ),
+            .o_fcr_txrst  (fcr_txrst ),
+            .o_thr_push   (thr_push  ),
+            .o_thr_data   (thr_data  ),
+            .i_rbr_data   (rbr_data  ),
+            .o_rbr_pop    (rbr_pop   ),
+            .i_lsr        (lsr       ),
+            .o_lsr_rd     (lsr_rd    ),
+            .i_msr        (msr       ),
+            .o_msr_rd     (msr_rd    ),
+            .i_iir        (iir       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        // Drives one AXI write; reports bvalid and the THR/FCR pulse outputs
+        // sampled on the same cycle BVALID is asserted (i.e. the write's
+        // 1-cycle side-effect window).
+        task automatic axi_write(input  logic [4:0] addr, input  logic [31:0] data,
+                                  output logic       bv_now, output logic thr_push_now);
+            awaddr  = addr;
+            wdata   = data;
+            wstrb   = 4'hF;
+            awvalid = 1;
+            wvalid  = 1;
+            bready  = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+            bv_now       = bvalid;
+            thr_push_now = thr_push;
+            if (!bv_now) $fatal(1, "Expected bvalid asserted after write to addr %0h", addr);
+            next(1);
+            if (bvalid) $fatal(1, "Expected bvalid to clear after BRESP consumed (addr %0h)", addr);
+        endtask
+
+        task automatic axi_read(input  logic [4:0]  addr,
+                                 output logic [31:0] data, output logic rbr_pop_now);
+            araddr  = addr;
+            arvalid = 1;
+            rready  = 1;
+            next(1);
+            arvalid = 0;
+            if (!rvalid) $fatal(1, "Expected rvalid asserted after read from addr %0h", addr);
+            data        = rdata;
+            rbr_pop_now = rbr_pop;
+            next(1);
+            if (rvalid) $fatal(1, "Expected rvalid to clear after RDATA consumed (addr %0h)", addr);
+        endtask
+
+        logic        bv, pop;
+        logic [31:0] rd;
+
+        initial begin
+            rst_n    = 0;
+            awvalid  = 0; awaddr = 0; awprot = 0;
+            wvalid   = 0; wdata  = 0; wstrb  = 0;
+            bready   = 0;
+            arvalid  = 0; araddr = 0; arprot = 0;
+            rready   = 0;
+            rbr_data = 0;
+            lsr      = 0;
+            msr      = 0;
+            iir      = 0;
+
+            next(5);
+            rst_n = 1;
+            next(2);
+
+            // DLAB=0 (reset default): offset 0x00 → THR, 0x04 → IER.
+            axi_write(5'h00, 32'h0000005A, bv, pop);
+            if (!pop) $fatal(1, "Expected thr_push pulse on THR write (DLAB=0)");
+            if (thr_data !== 8'h5A) $fatal(1, "Expected thr_data=0x5A, got %h", thr_data);
+            if (dll !== 8'h00) $fatal(1, "Expected DLL untouched by THR write, got %h", dll);
+
+            axi_write(5'h04, 32'h0000000F, bv, pop);
+            if (ier !== 8'h0F) $fatal(1, "Expected IER=0x0F, got %h", ier);
+            if (dlm !== 8'h00) $fatal(1, "Expected DLM untouched by IER write, got %h", dlm);
+
+            // Set DLAB=1 via LCR.
+            axi_write(5'h0C, 32'h00000080, bv, pop);
+            if (lcr !== 8'h80) $fatal(1, "Expected LCR=0x80 (DLAB=1), got %h", lcr);
+
+            // DLAB=1: offset 0x00 → DLL, 0x04 → DLM. THR must not fire.
+            axi_write(5'h00, 32'h000000A5, bv, pop);
+            if (pop) $fatal(1, "Expected no thr_push while DLAB=1");
+            if (dll !== 8'hA5) $fatal(1, "Expected DLL=0xA5, got %h", dll);
+
+            axi_write(5'h04, 32'h0000003C, bv, pop);
+            if (dlm !== 8'h3C) $fatal(1, "Expected DLM=0x3C, got %h", dlm);
+            if (ier !== 8'h0F) $fatal(1, "Expected IER untouched by DLM write, got %h", ier);
+
+            // Read side, DLAB=1: 0x00 → DLL, 0x04 → DLM.
+            axi_read(5'h00, rd, pop);
+            if (rd !== 32'h000000A5) $fatal(1, "Expected RDATA=DLL=0xA5, got %h", rd);
+            axi_read(5'h04, rd, pop);
+            if (rd !== 32'h0000003C) $fatal(1, "Expected RDATA=DLM=0x3C, got %h", rd);
+
+            // Clear DLAB.
+            axi_write(5'h0C, 32'h00000000, bv, pop);
+
+            // Read side, DLAB=0: 0x00 → RBR (pass-through + pop strobe), 0x04 → IER.
+            rbr_data = 8'h99;
+            axi_read(5'h00, rd, pop);
+            if (rd !== 32'h00000099) $fatal(1, "Expected RDATA=RBR=0x99, got %h", rd);
+            if (!pop) $fatal(1, "Expected rbr_pop pulse on RBR read (DLAB=0)");
+
+            axi_read(5'h04, rd, pop);
+            if (rd !== 32'h0000000F) $fatal(1, "Expected RDATA=IER=0x0F, got %h", rd);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 3: FCR write decodes RXRST/TXRST pulses; RXTRIG persists ─────────
+#[test(test_uart_regs_fcr_pulses)]
+embed (inline) sv{{{
+    module test_uart_regs_fcr_pulses;
+        logic        clk, rst_n;
+        logic        awvalid, awready;
+        logic [4:0]  awaddr;
+        logic [2:0]  awprot;
+        logic        wvalid, wready;
+        logic [31:0] wdata;
+        logic [3:0]  wstrb;
+        logic        bvalid, bready;
+        logic [1:0]  bresp;
+        logic        arvalid, arready;
+        logic [4:0]  araddr;
+        logic [2:0]  arprot;
+        logic        rvalid, rready;
+        logic [31:0] rdata;
+        logic [1:0]  rresp;
+        logic [7:0]  dll, dlm, ier, lcr, mcr, scr;
+        logic [1:0]  fcr_rxtrig;
+        logic        fcr_rxrst, fcr_txrst;
+        logic        thr_push;
+        logic [7:0]  thr_data;
+        logic [7:0]  rbr_data;
+        logic        rbr_pop;
+        logic [7:0]  lsr, msr, iir;
+        logic        lsr_rd, msr_rd;
+
+        uart_16550_veryl_UartRegs u_dut (
+            .i_clk        (clk       ),
+            .i_rst_n      (rst_n     ),
+            .i_axi_awvalid(awvalid   ),
+            .o_axi_awready(awready   ),
+            .i_axi_awaddr (awaddr    ),
+            .i_axi_awprot (awprot    ),
+            .i_axi_wvalid (wvalid    ),
+            .o_axi_wready (wready    ),
+            .i_axi_wdata  (wdata     ),
+            .i_axi_wstrb  (wstrb     ),
+            .o_axi_bvalid (bvalid    ),
+            .i_axi_bready (bready    ),
+            .o_axi_bresp  (bresp     ),
+            .i_axi_arvalid(arvalid   ),
+            .o_axi_arready(arready   ),
+            .i_axi_araddr (araddr    ),
+            .i_axi_arprot (arprot    ),
+            .o_axi_rvalid (rvalid    ),
+            .i_axi_rready (rready    ),
+            .o_axi_rdata  (rdata     ),
+            .o_axi_rresp  (rresp     ),
+            .o_dll        (dll       ),
+            .o_dlm        (dlm       ),
+            .o_ier        (ier       ),
+            .o_lcr        (lcr       ),
+            .o_mcr        (mcr       ),
+            .o_scr        (scr       ),
+            .o_fcr_rxtrig (fcr_rxtrig),
+            .o_fcr_rxrst  (fcr_rxrst ),
+            .o_fcr_txrst  (fcr_txrst ),
+            .o_thr_push   (thr_push  ),
+            .o_thr_data   (thr_data  ),
+            .i_rbr_data   (rbr_data  ),
+            .o_rbr_pop    (rbr_pop   ),
+            .i_lsr        (lsr       ),
+            .o_lsr_rd     (lsr_rd    ),
+            .i_msr        (msr       ),
+            .o_msr_rd     (msr_rd    ),
+            .i_iir        (iir       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [31:0] data);
+            awaddr  = addr;
+            wdata   = data;
+            wstrb   = 4'hF;
+            awvalid = 1;
+            wvalid  = 1;
+            bready  = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+            if (!bvalid) $fatal(1, "Expected bvalid asserted after write to addr %0h", addr);
+            next(1);
+            if (bvalid) $fatal(1, "Expected bvalid to clear after BRESP consumed (addr %0h)", addr);
+        endtask
+
+        initial begin
+            rst_n    = 0;
+            awvalid  = 0; awaddr = 0; awprot = 0;
+            wvalid   = 0; wdata  = 0; wstrb  = 0;
+            bready   = 0;
+            arvalid  = 0; araddr = 0; arprot = 0;
+            rready   = 0;
+            rbr_data = 0;
+            lsr      = 0;
+            msr      = 0;
+            iir      = 0;
+
+            next(5);
+            rst_n = 1;
+            next(2);
+
+            // FCR = RXTRIG=10, RXRST=1, TXRST=1, FIFOEN=1 → 8'h87.
+            // Drive AW/W directly (rather than via axi_write) so we can sample
+            // the pulses on the very same cycle BVALID is asserted.
+            awaddr  = 5'h08;
+            wdata   = 32'h00000087;
+            wstrb   = 4'hF;
+            awvalid = 1;
+            wvalid  = 1;
+            bready  = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+
+            if (!fcr_rxrst) $fatal(1, "Expected fcr_rxrst pulse on FCR write with RXRST=1");
+            if (!fcr_txrst) $fatal(1, "Expected fcr_txrst pulse on FCR write with TXRST=1");
+            if (fcr_rxtrig !== 2'b10) $fatal(1, "Expected RXTRIG=10, got %b", fcr_rxtrig);
+
+            next(1);
+            if (fcr_rxrst) $fatal(1, "Expected fcr_rxrst to clear the cycle after the pulse");
+            if (fcr_txrst) $fatal(1, "Expected fcr_txrst to clear the cycle after the pulse");
+            if (fcr_rxtrig !== 2'b10) $fatal(1, "Expected RXTRIG to stay 10 (persistent), got %b", fcr_rxtrig);
+            bready = 0;
+
+            // FCR = RXTRIG=01, RXRST=0, TXRST=0 → no pulses, RXTRIG updates.
+            axi_write(5'h08, 32'h00000040);
+            if (fcr_rxrst) $fatal(1, "Expected no fcr_rxrst pulse when RXRST=0");
+            if (fcr_txrst) $fatal(1, "Expected no fcr_txrst pulse when TXRST=0");
+            if (fcr_rxtrig !== 2'b01) $fatal(1, "Expected RXTRIG=01, got %b", fcr_rxtrig);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 4: LSR/MSR read strobes; IIR mux; MCR/SCR storage ────────────────
+#[test(test_uart_regs_status_strobes)]
+embed (inline) sv{{{
+    module test_uart_regs_status_strobes;
+        logic        clk, rst_n;
+        logic        awvalid, awready;
+        logic [4:0]  awaddr;
+        logic [2:0]  awprot;
+        logic        wvalid, wready;
+        logic [31:0] wdata;
+        logic [3:0]  wstrb;
+        logic        bvalid, bready;
+        logic [1:0]  bresp;
+        logic        arvalid, arready;
+        logic [4:0]  araddr;
+        logic [2:0]  arprot;
+        logic        rvalid, rready;
+        logic [31:0] rdata;
+        logic [1:0]  rresp;
+        logic [7:0]  dll, dlm, ier, lcr, mcr, scr;
+        logic [1:0]  fcr_rxtrig;
+        logic        fcr_rxrst, fcr_txrst;
+        logic        thr_push;
+        logic [7:0]  thr_data;
+        logic [7:0]  rbr_data;
+        logic        rbr_pop;
+        logic [7:0]  lsr, msr, iir;
+        logic        lsr_rd, msr_rd;
+
+        uart_16550_veryl_UartRegs u_dut (
+            .i_clk        (clk       ),
+            .i_rst_n      (rst_n     ),
+            .i_axi_awvalid(awvalid   ),
+            .o_axi_awready(awready   ),
+            .i_axi_awaddr (awaddr    ),
+            .i_axi_awprot (awprot    ),
+            .i_axi_wvalid (wvalid    ),
+            .o_axi_wready (wready    ),
+            .i_axi_wdata  (wdata     ),
+            .i_axi_wstrb  (wstrb     ),
+            .o_axi_bvalid (bvalid    ),
+            .i_axi_bready (bready    ),
+            .o_axi_bresp  (bresp     ),
+            .i_axi_arvalid(arvalid   ),
+            .o_axi_arready(arready   ),
+            .i_axi_araddr (araddr    ),
+            .i_axi_arprot (arprot    ),
+            .o_axi_rvalid (rvalid    ),
+            .i_axi_rready (rready    ),
+            .o_axi_rdata  (rdata     ),
+            .o_axi_rresp  (rresp     ),
+            .o_dll        (dll       ),
+            .o_dlm        (dlm       ),
+            .o_ier        (ier       ),
+            .o_lcr        (lcr       ),
+            .o_mcr        (mcr       ),
+            .o_scr        (scr       ),
+            .o_fcr_rxtrig (fcr_rxtrig),
+            .o_fcr_rxrst  (fcr_rxrst ),
+            .o_fcr_txrst  (fcr_txrst ),
+            .o_thr_push   (thr_push  ),
+            .o_thr_data   (thr_data  ),
+            .i_rbr_data   (rbr_data  ),
+            .o_rbr_pop    (rbr_pop   ),
+            .i_lsr        (lsr       ),
+            .o_lsr_rd     (lsr_rd    ),
+            .i_msr        (msr       ),
+            .o_msr_rd     (msr_rd    ),
+            .i_iir        (iir       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [31:0] data);
+            awaddr  = addr;
+            wdata   = data;
+            wstrb   = 4'hF;
+            awvalid = 1;
+            wvalid  = 1;
+            bready  = 1;
+            next(1);
+            awvalid = 0;
+            wvalid  = 0;
+            if (!bvalid) $fatal(1, "Expected bvalid asserted after write to addr %0h", addr);
+            next(1);
+            if (bvalid) $fatal(1, "Expected bvalid to clear after BRESP consumed (addr %0h)", addr);
+        endtask
+
+        // Reads addr, sampling RDATA and the LSR/MSR strobes on the same
+        // cycle RVALID is asserted (the read's 1-cycle side-effect window).
+        task automatic axi_read(input  logic [4:0]  addr, output logic [31:0] data,
+                                 output logic lsr_rd_now, output logic msr_rd_now);
+            araddr  = addr;
+            arvalid = 1;
+            rready  = 1;
+            next(1);
+            arvalid = 0;
+            if (!rvalid) $fatal(1, "Expected rvalid asserted after read from addr %0h", addr);
+            data       = rdata;
+            lsr_rd_now = lsr_rd;
+            msr_rd_now = msr_rd;
+            next(1);
+            if (rvalid) $fatal(1, "Expected rvalid to clear after RDATA consumed (addr %0h)", addr);
+        endtask
+
+        logic [31:0] rd;
+        logic        l_rd, m_rd;
+
+        initial begin
+            rst_n    = 0;
+            awvalid  = 0; awaddr = 0; awprot = 0;
+            wvalid   = 0; wdata  = 0; wstrb  = 0;
+            bready   = 0;
+            arvalid  = 0; araddr = 0; arprot = 0;
+            rready   = 0;
+            rbr_data = 0;
+            lsr      = 0;
+            msr      = 0;
+            iir      = 0;
+
+            next(5);
+            rst_n = 1;
+            next(2);
+
+            lsr = 8'hA5;
+            axi_read(5'h14, rd, l_rd, m_rd);
+            if (rd !== 32'h000000A5) $fatal(1, "Expected RDATA=LSR=0xA5, got %h", rd);
+            if (!l_rd) $fatal(1, "Expected lsr_rd pulse on LSR read");
+            if (m_rd) $fatal(1, "Expected no msr_rd pulse on LSR read");
+
+            msr = 8'h5A;
+            axi_read(5'h18, rd, l_rd, m_rd);
+            if (rd !== 32'h0000005A) $fatal(1, "Expected RDATA=MSR=0x5A, got %h", rd);
+            if (!m_rd) $fatal(1, "Expected msr_rd pulse on MSR read");
+            if (l_rd) $fatal(1, "Expected no lsr_rd pulse on MSR read");
+
+            iir = 8'hC2;
+            axi_read(5'h08, rd, l_rd, m_rd);
+            if (rd !== 32'h000000C2) $fatal(1, "Expected RDATA=IIR=0xC2, got %h", rd);
+            if (l_rd || m_rd) $fatal(1, "Expected no LSR/MSR strobe on IIR read");
+
+            // MCR: reserved bits [7:5] masked to 0 on write.
+            axi_write(5'h10, 32'h000000FF);
+            if (mcr !== 8'h1F) $fatal(1, "Expected MCR=0x1F (reserved bits masked), got %h", mcr);
+            axi_read(5'h10, rd, l_rd, m_rd);
+            if (rd !== 32'h0000001F) $fatal(1, "Expected RDATA=MCR=0x1F, got %h", rd);
+
+            // SCR: all 8 bits stored, no masking.
+            axi_write(5'h1C, 32'h00000077);
+            if (scr !== 8'h77) $fatal(1, "Expected SCR=0x77, got %h", scr);
+            axi_read(5'h1C, rd, l_rd, m_rd);
+            if (rd !== 32'h00000077) $fatal(1, "Expected RDATA=SCR=0x77, got %h", rd);
+
+            $finish();
+        end
+    endmodule
+}}}

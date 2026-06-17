@@ -77,7 +77,7 @@ Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed)
 | 1 | `src/baud_gen.veryl` | `test/test_baud_gen.veryl` | ✅ done |
 | 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | ✅ done |
 | 3 | `src/uart_rx.veryl` | `test/test_uart_rx.veryl` | ✅ done |
-| 4 | `src/uart_regs.veryl` | `test/test_uart_regs.veryl` | 🔲 pending |
+| 4 | `src/uart_regs.veryl` | `test/test_uart_regs.veryl` | ✅ done |
 | 5 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
 
 ### `$std::fifo` usage
@@ -110,19 +110,12 @@ TX shift register driven by `BaudGen`'s 16× enable.
 AXI4-Lite slave + register storage/decode, with no UART semantics of its own. All
 status computation (LSR/MSR bit assembly, OE/DCTS sticky bits, interrupt priority
 encoder) lives in `Uart16550` and is just muxed through here on read.
-- Port list stays flat (`i_axi_awvalid`, `o_axi_awready`, ... per `SPEC.md`), matching
-  every other module in this project — keeps `test/test_uart_regs.veryl` a plain
-  embedded-SV testbench like the rest, with no SV `interface`/modport plumbing needed
-  on the test side.
-- Internally, instantiate `$std::axi4_lite_if::<$std::axi4_lite_pkg::<5, 4, 1>>` and
-  bridge the flat ports to its signals with `assign`s (tie `awid`/`bid`/`arid`/`rid` to
-  `1'b0`/`'0` — this project doesn't use AXI IDs). `ADDR_W=5` matches `i_axi_awaddr`/
-  `i_axi_araddr`'s width per `SPEC.md` (enough for the register map's `0x00`–`0x1C`
-  offsets), so they connect straight through to `u_axi.awaddr`/`u_axi.araddr` with no
-  slicing needed. Use the interface's
-  `awaddr_ack()`/`wdata_ack()`/`bresp_ack()`/`araddr_ack()`/`rdata_ack()` functions in
-  the handshake FSM instead of hand-rolling `valid && ready` everywhere.
-- AW/W accepted simultaneously; BRESP next cycle; AR→RDATA next cycle.
+- Port list is flat (`i_axi_awvalid`, `o_axi_awready`, ... per `SPEC.md`); no std
+  interface used internally — handshake signals are plain `logic` wires.
+- Slave waits for both AWVALID and WVALID before asserting AWREADY/WREADY (each
+  ready depends on the *other* channel's valid), so AW/W are always accepted in the
+  same cycle; a master presenting them in different cycles is handled correctly.
+  BRESP next cycle; AR→RDATA next cycle.
 - Register decode: offset bits `[4:2]` select register; DLAB gates DLL/DLM vs RBR/THR/IER.
 - Stores DLL, DLM, IER, LCR, MCR, SCR, and FCR's 2-bit RXTRIG field; exposes them as
   plain output ports for `BaudGen`/`UartTx`/`UartRx`/`Uart16550` to consume.

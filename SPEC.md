@@ -153,7 +153,7 @@ Each RX FIFO entry: `{BI, FE, PE, data[7:0]}`
 OE (overrun) is flagged when RX FIFO is full and a new byte arrives.
 
 ### AXI4-Lite handshake
-- AW and W channels accepted simultaneously in one cycle
+- Slave waits for both AWVALID and WVALID before asserting AWREADY/WREADY, so they are always accepted in the same cycle
 - BRESP asserted next cycle, stays until BREADY
 - AR accepted in one cycle, RDATA/RVALID asserted next cycle
 - All responses OKAY (2'b00)
