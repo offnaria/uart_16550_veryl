@@ -580,3 +580,298 @@ embed (inline) sv{{{
         end
     endmodule
 }}}
+
+// ─── Test 5: Multi-word stream through loopback ───────────────────────────────
+// Writes 8 bytes back-to-back into the TX FIFO with MCR.LOOP=1, then waits for
+// all frames to transit TX→RX (8 × 160 clocks at divisor=1, 8N1) and verifies
+// that RBR returns each byte in the original order.
+#[test(test_uart_16550_stream)]
+embed (inline) sv{{{
+    module test_uart_16550_stream;
+        logic        clk;
+        logic        rst_n;
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        task automatic axi_read(input logic [4:0] addr, output logic [7:0] data);
+            axi_arvalid = 1; axi_araddr = addr; axi_arprot = 0;
+            @(posedge clk);
+            axi_arvalid = 0;
+            @(posedge clk);
+            data = axi_rdata[7:0];
+            axi_rready = 1;
+            @(posedge clk);
+            axi_rready = 0;
+        endtask
+
+        localparam int N = 8;
+        logic [7:0] stream[N] = '{8'hDE, 8'hAD, 8'hBE, 8'hEF, 8'hCA, 8'hFE, 8'hBA, 8'hBE};
+        logic [7:0] rdata;
+        logic [7:0] lsr;
+
+        initial begin
+            rst_n       = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb   = 4'h1;
+            uart_rxd    = 1;
+            uart_cts    = 1;
+
+            next(5); rst_n = 1; next(3);
+
+            // Configure: divisor=1, 8N1, loopback.
+            axi_write(5'h0C, 8'h80); // LCR: DLAB=1
+            axi_write(5'h00, 8'h01); // DLL=1
+            axi_write(5'h0C, 8'h03); // LCR: 8N1, DLAB=0
+            axi_write(5'h10, 8'h10); // MCR: LOOP=1
+
+            // Burst-write all N bytes into the TX FIFO.  Because the FIFO holds
+            // 16 entries and we only send 8, no back-pressure occurs.
+            for (int i = 0; i < N; i++) begin
+                axi_write(5'h00, stream[i]);
+            end
+
+            // Wait for all N frames to complete through TX and RX.
+            // Each 8N1 frame takes 160 clocks; add margin for pipeline overhead.
+            next(N * 160 + 200);
+
+            // Read back N bytes from RBR and verify order.
+            for (int i = 0; i < N; i++) begin
+                axi_read(5'h14, lsr);
+                if (!lsr[0])
+                    $fatal(1, "Stream[%0d]: LSR.DR=0, expected data in FIFO", i);
+                axi_read(5'h00, rdata);
+                if (rdata !== stream[i])
+                    $fatal(1, "Stream[%0d]: expected 0x%02X, got 0x%02X",
+                           i, stream[i], rdata);
+            end
+
+            // FIFO should be empty now.
+            axi_read(5'h14, lsr);
+            if (lsr[0]) $fatal(1, "LSR.DR should be 0 after reading all bytes");
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 6: Burst stream larger than the 16-entry TX/RX FIFOs ───────────────
+// Sends 20 bytes in loopback.  Both TX and RX FIFOs are 16 entries deep, so
+// naive "write all then read all" overflows the RX FIFO.  The test uses a
+// combined loop that reads LSR once per iteration and:
+//   • writes THR if LSR.THRE=1 (TX FIFO not full) and bytes remain to send;
+//   • reads  RBR if LSR.DR=1  (RX data ready)    and bytes remain to receive.
+// This drains the RX FIFO as fast as it fills, preventing overflow, while
+// naturally stalling the writer when the TX FIFO is full.
+#[test(test_uart_16550_stream_overflow)]
+embed (inline) sv{{{
+    module test_uart_16550_stream_overflow;
+        logic        clk;
+        logic        rst_n;
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        task automatic axi_read(input logic [4:0] addr, output logic [7:0] data);
+            axi_arvalid = 1; axi_araddr = addr; axi_arprot = 0;
+            @(posedge clk);
+            axi_arvalid = 0;
+            @(posedge clk);
+            data = axi_rdata[7:0];
+            axi_rready = 1;
+            @(posedge clk);
+            axi_rready = 0;
+        endtask
+
+        localparam int N = 20;
+        logic [7:0] stream[N];
+        logic [7:0] rdata;
+        logic [7:0] lsr;
+        int sent;
+        int rcvd;
+
+        initial begin
+            rst_n       = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb   = 4'h1;
+            uart_rxd    = 1;
+            uart_cts    = 1;
+
+            // Incrementing pattern: 0x01 … 0x14
+            for (int i = 0; i < N; i++) stream[i] = 8'(i + 1);
+
+            next(5); rst_n = 1; next(3);
+
+            // Configure: divisor=1, 8N1, loopback.
+            axi_write(5'h0C, 8'h80); // LCR: DLAB=1
+            axi_write(5'h00, 8'h01); // DLL=1
+            axi_write(5'h0C, 8'h03); // LCR: 8N1, DLAB=0
+            axi_write(5'h10, 8'h10); // MCR: LOOP=1
+
+            // Combined TX-write / RX-read loop.
+            // One LSR read per iteration keeps the bus busy in only one
+            // direction at a time; the single snapshot drives both decisions.
+            sent = 0; rcvd = 0;
+            while (rcvd < N) begin
+                axi_read(5'h14, lsr);
+                // Write one byte if TX FIFO has space and stream not exhausted.
+                if (sent < N && lsr[5]) begin
+                    axi_write(5'h00, stream[sent]);
+                    sent++;
+                end
+                // Read one byte if RX FIFO has data.
+                if (lsr[0]) begin
+                    axi_read(5'h00, rdata);
+                    if (rdata !== stream[rcvd])
+                        $fatal(1, "Stream[%0d]: expected 0x%02X, got 0x%02X",
+                               rcvd, stream[rcvd], rdata);
+                    rcvd++;
+                end
+            end
+
+            // Verify FIFO is empty after reading all bytes.
+            axi_read(5'h14, lsr);
+            if (lsr[0]) $fatal(1, "LSR.DR should be 0 after reading all bytes");
+
+            $finish();
+        end
+    endmodule
+}}}
