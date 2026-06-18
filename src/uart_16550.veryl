@@ -1,0 +1,286 @@
+pub module Uart16550 #(
+    param CLK_FREQ: u32 = 50_000_000,
+) (
+    i_clk  : input clock,
+    i_rst_n: input reset,
+    // AXI4-Lite slave (5-bit address covers the 0x00-0x1C register map)
+    i_axi_awvalid: input  logic    ,
+    o_axi_awready: output logic    ,
+    i_axi_awaddr : input  logic<5> ,
+    i_axi_awprot : input  logic<3> ,
+    i_axi_wvalid : input  logic    ,
+    o_axi_wready : output logic    ,
+    i_axi_wdata  : input  logic<32>,
+    i_axi_wstrb  : input  logic<4> ,
+    o_axi_bvalid : output logic    ,
+    i_axi_bready : input  logic    ,
+    o_axi_bresp  : output logic<2> ,
+    i_axi_arvalid: input  logic    ,
+    o_axi_arready: output logic    ,
+    i_axi_araddr : input  logic<5> ,
+    i_axi_arprot : input  logic<3> ,
+    o_axi_rvalid : output logic    ,
+    i_axi_rready : input  logic    ,
+    o_axi_rdata  : output logic<32>,
+    o_axi_rresp  : output logic<2> ,
+    // UART pins
+    i_uart_rxd: input  logic,
+    o_uart_txd: output logic,
+    i_uart_cts: input  logic,
+    o_uart_rts: output logic,
+    // Interrupt (active-high level, gated by MCR.OUT2)
+    o_intr: output logic,
+) {
+    // Outputs from UartRegs
+    var w_dll       : logic<8>;
+    var w_dlm       : logic<8>;
+    var w_ier       : logic<8>;
+    var w_lcr       : logic<8>;
+    var w_mcr       : logic<8>;
+    var w_scr       : logic<8>;
+    var w_fcr_rxtrig: logic<2>;
+    var w_fcr_rxrst : logic   ;
+    var w_fcr_txrst : logic   ;
+    var w_thr_push  : logic   ;
+    var w_thr_data  : logic<8>;
+    var w_rbr_pop   : logic   ;
+    var w_lsr_rd    : logic   ;
+    var w_msr_rd    : logic   ;
+
+    var w_baud_en: logic;
+
+    // TX outputs
+    var w_txd         : logic;
+    var w_tx_fifo_full: logic;
+    var w_tx_idle     : logic;
+
+    // RX outputs
+    var w_rx_data      : logic<11>;
+    var w_rx_empty     : logic    ;
+    var w_rx_word_count: logic<5> ;
+    var w_rx_overrun   : logic    ;
+
+    // Loopback: TX feeds back to RX; RTS feeds back to CTS (active-high internally)
+    var w_loop  : logic;
+    var w_cts   : logic;
+    var w_rx_rxd: logic;
+    assign w_loop = w_mcr[4];
+    always_comb {
+        if w_loop {
+            w_cts    = w_mcr[1];
+            w_rx_rxd = w_txd;
+        } else {
+            w_cts    = !i_uart_cts;
+            w_rx_rxd = i_uart_rxd;
+        }
+    }
+
+    // LSR error flags from RX FIFO head, gated by DR (= !rx_empty)
+    var w_dr: logic;
+    var w_pe: logic;
+    var w_fe: logic;
+    var w_bi: logic;
+    assign w_dr = !w_rx_empty;
+    assign w_pe = w_rx_data[8] & w_dr;
+    assign w_fe = w_rx_data[9] & w_dr;
+    assign w_bi = w_rx_data[10] & w_dr;
+
+    // Sticky status bits (cleared by reading LSR / MSR)
+    var r_oe      : logic;
+    var r_dcts    : logic;
+    var r_cts_prev: logic;
+
+    // RX timeout: counts baud_en ticks while FIFO is non-empty; fires after ~4 character
+    // times (640 baud-en ticks at 8N1), resets on any FIFO word-count change or flush.
+    var r_rx_timeout_cnt  : logic<10>;
+    var r_rx_timeout_fired: logic    ;
+    var r_rx_wc_prev      : logic<5> ;
+
+    // RX trigger level decoded from FCR[7:6]
+    var w_rx_trigger_level: logic<5>;
+    always_comb {
+        case w_fcr_rxtrig {
+            2'b00  : w_rx_trigger_level = 5'd1;
+            2'b01  : w_rx_trigger_level = 5'd4;
+            2'b10  : w_rx_trigger_level = 5'd8;
+            2'b11  : w_rx_trigger_level = 5'd14;
+            default: w_rx_trigger_level = 5'd1;
+        }
+    }
+
+    // Interrupt source qualifications (enabled pending conditions)
+    var w_lsr_pending      : logic;
+    var w_rda_pending      : logic;
+    var w_rxtimeout_pending: logic;
+    var w_thre_pending     : logic;
+    var w_msr_pending      : logic;
+    var w_any_pending      : logic;
+    assign w_lsr_pending       = (r_oe | w_pe | w_fe | w_bi) & w_ier[2];
+    assign w_rda_pending       = !w_rx_empty & (w_rx_word_count >= w_rx_trigger_level) & w_ier[0];
+    assign w_rxtimeout_pending = r_rx_timeout_fired & !w_rx_empty & w_ier[0];
+    assign w_thre_pending      = w_tx_idle & w_ier[1];
+    assign w_msr_pending       = r_dcts & w_ier[3];
+    assign w_any_pending       = w_lsr_pending | w_rda_pending | w_rxtimeout_pending | w_thre_pending | w_msr_pending;
+
+    // IIR priority encoder: highest-priority pending interrupt wins
+    var w_iir: logic<8>;
+    always_comb {
+        if w_lsr_pending {
+            w_iir = 8'b1100_0110; // FIFOEN=11, ID=011 (LSR error), nIP=0
+        } else if w_rda_pending {
+            w_iir = 8'b1100_0100; // ID=010 (RDA)
+        } else if w_rxtimeout_pending {
+            w_iir = 8'b1100_1100; // ID=110 (RX timeout)
+        } else if w_thre_pending {
+            w_iir = 8'b1100_0010; // ID=001 (THRE)
+        } else if w_msr_pending {
+            w_iir = 8'b1100_0000; // ID=000 (MSR)
+        } else {
+            w_iir = 8'b1100_0011; // nIP=1, no interrupt pending
+        }
+    }
+
+    // Live LSR and MSR vectors fed into UartRegs on every read
+    var w_fifoerr: logic   ;
+    var w_thre   : logic   ;
+    var w_lsr    : logic<8>;
+    var w_msr    : logic<8>;
+    assign w_fifoerr = w_bi | w_fe | w_pe;
+    assign w_thre    = !w_tx_fifo_full;
+    assign w_lsr     = {w_fifoerr, w_tx_idle, w_thre, w_bi, w_fe, w_pe, r_oe, w_dr};
+    assign w_msr     = {1'b1, 1'b0, 1'b1, w_cts, 3'b000, r_dcts};
+
+    always_ff {
+        if_reset {
+            r_oe               = '0;
+            r_dcts             = '0;
+            r_cts_prev         = '0;
+            r_rx_timeout_cnt   = '0;
+            r_rx_timeout_fired = '0;
+            r_rx_wc_prev       = '0;
+        } else {
+            // OE sticky: set by any overrun, cleared when software reads LSR
+            if w_rx_overrun {
+                r_oe = '1;
+            } else if w_lsr_rd {
+                r_oe = '0;
+            }
+
+            // DCTS sticky: set on any CTS level change, cleared when software reads MSR
+            r_cts_prev = w_cts;
+            if w_cts != r_cts_prev {
+                r_dcts = '1;
+            } else if w_msr_rd {
+                r_dcts = '0;
+            }
+
+            // RX timeout counter: any word-count change resets the timer so that
+            // "4 char times with no read activity" is measured correctly.
+            r_rx_wc_prev = w_rx_word_count;
+            if w_fcr_rxrst || w_rx_empty || (w_rx_word_count != r_rx_wc_prev) {
+                r_rx_timeout_cnt   = '0;
+                r_rx_timeout_fired = '0;
+            } else if w_baud_en {
+                if r_rx_timeout_cnt >= 10'd639 {
+                    r_rx_timeout_fired = '1;
+                } else {
+                    r_rx_timeout_cnt = r_rx_timeout_cnt + 10'd1;
+                }
+            }
+        }
+    }
+
+    inst u_baud_gen: BaudGen ( i_clk: i_clk, i_rst_n: i_rst_n, i_div: {w_dlm, w_dll}, o_en: w_baud_en );
+
+    inst u_tx: UartTx (
+        i_clk      : i_clk         ,
+        i_rst_n    : i_rst_n       ,
+        i_baud_en  : w_baud_en     ,
+        i_push     : w_thr_push    ,
+        i_data     : w_thr_data    ,
+        i_clear    : w_fcr_txrst   ,
+        i_lcr_wls  : w_lcr[1:0]    ,
+        i_lcr_stb  : w_lcr[2]      ,
+        i_lcr_pen  : w_lcr[3]      ,
+        i_lcr_eps  : w_lcr[4]      ,
+        i_lcr_sp   : w_lcr[5]      ,
+        i_lcr_bc   : w_lcr[6]      ,
+        o_txd      : w_txd         ,
+        o_fifo_full: w_tx_fifo_full,
+        o_idle     : w_tx_idle     ,
+    );
+
+    inst u_rx: UartRx (
+        i_clk       : i_clk          ,
+        i_rst_n     : i_rst_n        ,
+        i_baud_en   : w_baud_en      ,
+        i_rxd       : w_rx_rxd       ,
+        i_clear     : w_fcr_rxrst    ,
+        i_pop       : w_rbr_pop      ,
+        i_lcr_wls   : w_lcr[1:0]     ,
+        i_lcr_pen   : w_lcr[3]       ,
+        i_lcr_eps   : w_lcr[4]       ,
+        i_lcr_sp    : w_lcr[5]       ,
+        o_data      : w_rx_data      ,
+        o_empty     : w_rx_empty     ,
+        o_word_count: w_rx_word_count,
+        o_overrun   : w_rx_overrun   ,
+    );
+
+    inst u_regs: UartRegs (
+        i_clk        : i_clk         ,
+        i_rst_n      : i_rst_n       ,
+        i_axi_awvalid: i_axi_awvalid ,
+        o_axi_awready: o_axi_awready ,
+        i_axi_awaddr : i_axi_awaddr  ,
+        i_axi_awprot : i_axi_awprot  ,
+        i_axi_wvalid : i_axi_wvalid  ,
+        o_axi_wready : o_axi_wready  ,
+        i_axi_wdata  : i_axi_wdata   ,
+        i_axi_wstrb  : i_axi_wstrb   ,
+        o_axi_bvalid : o_axi_bvalid  ,
+        i_axi_bready : i_axi_bready  ,
+        o_axi_bresp  : o_axi_bresp   ,
+        i_axi_arvalid: i_axi_arvalid ,
+        o_axi_arready: o_axi_arready ,
+        i_axi_araddr : i_axi_araddr  ,
+        i_axi_arprot : i_axi_arprot  ,
+        o_axi_rvalid : o_axi_rvalid  ,
+        i_axi_rready : i_axi_rready  ,
+        o_axi_rdata  : o_axi_rdata   ,
+        o_axi_rresp  : o_axi_rresp   ,
+        o_dll        : w_dll         ,
+        o_dlm        : w_dlm         ,
+        o_ier        : w_ier         ,
+        o_lcr        : w_lcr         ,
+        o_mcr        : w_mcr         ,
+        o_scr        : w_scr         ,
+        o_fcr_rxtrig : w_fcr_rxtrig  ,
+        o_fcr_rxrst  : w_fcr_rxrst   ,
+        o_fcr_txrst  : w_fcr_txrst   ,
+        o_thr_push   : w_thr_push    ,
+        o_thr_data   : w_thr_data    ,
+        i_rbr_data   : w_rx_data[7:0],
+        o_rbr_pop    : w_rbr_pop     ,
+        i_lsr        : w_lsr         ,
+        o_lsr_rd     : w_lsr_rd      ,
+        i_msr        : w_msr         ,
+        o_msr_rd     : w_msr_rd      ,
+        i_iir        : w_iir         ,
+    );
+
+    var w_uart_txd: logic;
+    var w_uart_rts: logic;
+    always_comb {
+        if w_loop {
+            w_uart_txd = '1;
+            w_uart_rts = '1;
+        } else {
+            w_uart_txd = w_txd;
+            w_uart_rts = !w_mcr[1];
+        }
+    }
+    assign o_uart_txd = w_uart_txd;
+    assign o_uart_rts = w_uart_rts;
+    assign o_intr     = w_mcr[3] & w_any_pending;
+}

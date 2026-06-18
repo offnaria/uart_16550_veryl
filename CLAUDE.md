@@ -78,7 +78,7 @@ Full design spec is in `SPEC.md`. FIFOs use `$std::fifo` (no custom FIFO needed)
 | 2 | `src/uart_tx.veryl` | `test/test_uart_tx.veryl` | ✅ done |
 | 3 | `src/uart_rx.veryl` | `test/test_uart_rx.veryl` | ✅ done |
 | 4 | `src/uart_regs.veryl` | `test/test_uart_regs.veryl` | ✅ done |
-| 5 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | 🔲 pending |
+| 5 | `src/uart_16550.veryl` | `test/test_uart_16550.veryl` | ✅ done |
 
 ### `$std::fifo` usage
 - TX FIFO: `$std::fifo #(WIDTH: 8, DEPTH: 16)` — `i_clear` maps to FCR.TXRST

@@ -1,0 +1,582 @@
+// Uart16550 integration tests — embedded SystemVerilog testbenches.
+// divisor=1 → baud_en fires every clock; 1 bit period = 16 clocks; 8N1 frame ≈ 160 clocks.
+// Reset: 5 cycles, then 3 settle clocks for FIFO flag initialisation.
+
+// ─── Test 1: AXI register write / read-back ──────────────────────────────────
+// Writes DLL/DLM/LCR/SCR and MCR via AXI, reads them back to confirm decode.
+#[test(test_uart_16550_config)]
+embed (inline) sv{{{
+    module test_uart_16550_config;
+        logic        clk;
+        logic        rst_n;
+        // AXI write
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        // AXI read
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        // UART pins
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        task automatic axi_read(input logic [4:0] addr, output logic [7:0] data);
+            axi_arvalid = 1; axi_araddr = addr; axi_arprot = 0;
+            @(posedge clk);
+            axi_arvalid = 0;
+            @(posedge clk);
+            data = axi_rdata[7:0];
+            axi_rready = 1;
+            @(posedge clk);
+            axi_rready = 0;
+        endtask
+
+        logic [7:0] rdata;
+
+        initial begin
+            rst_n      = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb  = 4'h1;
+            uart_rxd   = 1;
+            uart_cts   = 1; // inactive (active-low)
+
+            next(5); rst_n = 1; next(3);
+
+            // ── Set DLAB=1 to access DLL/DLM ─────────────────────────────
+            axi_write(5'h0C, 8'h80); // LCR = 0x80 (DLAB=1)
+            axi_write(5'h00, 8'h07); // DLL = 7
+            axi_write(5'h04, 8'h03); // DLM = 3
+
+            // ── Read DLL and DLM back ─────────────────────────────────────
+            axi_read(5'h00, rdata);
+            if (rdata !== 8'h07) $fatal(1, "DLL: expected 0x07, got 0x%02X", rdata);
+            axi_read(5'h04, rdata);
+            if (rdata !== 8'h03) $fatal(1, "DLM: expected 0x03, got 0x%02X", rdata);
+
+            // ── Set DLAB=0, configure LCR = 8N1 ─────────────────────────
+            axi_write(5'h0C, 8'h03); // LCR = 0x03 (8N1, DLAB=0)
+            axi_read(5'h0C, rdata);
+            if (rdata !== 8'h03) $fatal(1, "LCR: expected 0x03, got 0x%02X", rdata);
+
+            // ── MCR: write 0xFF → read back masked to 0x1F (5-bit field) ─
+            axi_write(5'h10, 8'hFF); // MCR
+            axi_read(5'h10, rdata);
+            if (rdata !== 8'h1F) $fatal(1, "MCR: expected 0x1F, got 0x%02X", rdata);
+
+            // ── IER: write 0x0F → read back masked to 0x0F (4-bit field) ─
+            axi_write(5'h04, 8'h0F); // IER (DLAB=0)
+            axi_read(5'h04, rdata);
+            if (rdata !== 8'h0F) $fatal(1, "IER: expected 0x0F, got 0x%02X", rdata);
+
+            // ── SCR round-trip ────────────────────────────────────────────
+            axi_write(5'h1C, 8'hA5); // SCR
+            axi_read(5'h1C, rdata);
+            if (rdata !== 8'hA5) $fatal(1, "SCR: expected 0xA5, got 0x%02X", rdata);
+
+            // ── IIR at reset: no interrupt, FIFOEN bits set (0xC3) ────────
+            // First clear IER so no spurious interrupt (MCR was 0x1F above)
+            axi_write(5'h04, 8'h00); // IER = 0 (disable all interrupts)
+            axi_read(5'h08, rdata);  // IIR
+            if (rdata !== 8'hC3) $fatal(1, "IIR idle: expected 0xC3, got 0x%02X", rdata);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 2: THR write → TX bitstream on o_uart_txd ─────────────────────────
+// 8N1, divisor=1.  Verifies the bit sequence using sample_bit (same technique
+// as test_uart_tx): advance 16 clocks per bit, read o_uart_txd at tick 7.
+#[test(test_uart_16550_txd)]
+embed (inline) sv{{{
+    module test_uart_16550_txd;
+        logic        clk;
+        logic        rst_n;
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        // Advance 16 clocks, sample o_uart_txd at tick 7 (centre of bit period).
+        task automatic sample_bit(output logic val);
+            for (int tick = 0; tick < 16; tick++) begin
+                @(posedge clk);
+                if (tick == 7) val = uart_txd;
+            end
+        endtask
+
+        logic       smp;
+        logic [7:0] exp_data;
+
+        initial begin
+            rst_n       = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb   = 4'h1;
+            uart_rxd    = 1;
+            uart_cts    = 1;
+
+            next(5); rst_n = 1; next(3);
+
+            // Configure: divisor=1, 8N1, no loopback.
+            axi_write(5'h0C, 8'h80); // LCR = 0x80 (DLAB=1)
+            axi_write(5'h00, 8'h01); // DLL = 1  → baud_en every clock
+            axi_write(5'h0C, 8'h03); // LCR = 0x03 (8N1, DLAB=0)
+
+            // Send 0xA5 = 10100101.
+            axi_write(5'h00, 8'hA5); // THR
+
+            // After the last axi_write the TX state machine entered Start
+            // (Idle→Start transition happens at the same posedge the write
+            // completes).  sample_bit() starts counting from tick 0 of that
+            // Start state, sampling at tick 7.
+
+            // ── Start bit (expect 0) ──────────────────────────────────────
+            sample_bit(smp);
+            if (smp !== 1'b0) $fatal(1, "Start: expected 0, got %b", smp);
+
+            // ── Data bits 0-7 (0xA5 LSB-first: 1,0,1,0,0,1,0,1) ─────────
+            exp_data = 8'hA5;
+            for (int b = 0; b < 8; b++) begin
+                sample_bit(smp);
+                if (smp !== exp_data[b])
+                    $fatal(1, "Data[%0d]: expected %b, got %b", b, exp_data[b], smp);
+            end
+
+            // ── Stop bit (expect 1) ───────────────────────────────────────
+            sample_bit(smp);
+            if (smp !== 1'b1) $fatal(1, "Stop: expected 1, got %b", smp);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 3: Loopback — write THR, read RBR ──────────────────────────────────
+// MCR.LOOP=1 feeds TX back to RX.  Verifies LSR.DR and correct RBR data.
+#[test(test_uart_16550_loopback)]
+embed (inline) sv{{{
+    module test_uart_16550_loopback;
+        logic        clk;
+        logic        rst_n;
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        task automatic axi_read(input logic [4:0] addr, output logic [7:0] data);
+            axi_arvalid = 1; axi_araddr = addr; axi_arprot = 0;
+            @(posedge clk);
+            axi_arvalid = 0;
+            @(posedge clk);
+            data = axi_rdata[7:0];
+            axi_rready = 1;
+            @(posedge clk);
+            axi_rready = 0;
+        endtask
+
+        logic [7:0] rdata;
+
+        initial begin
+            rst_n       = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb   = 4'h1;
+            uart_rxd    = 1;
+            uart_cts    = 1;
+
+            next(5); rst_n = 1; next(3);
+
+            // Configure: divisor=1, 8N1, loopback.
+            axi_write(5'h0C, 8'h80); // LCR = 0x80 (DLAB=1)
+            axi_write(5'h00, 8'h01); // DLL = 1
+            axi_write(5'h0C, 8'h03); // LCR = 0x03 (8N1, DLAB=0)
+            axi_write(5'h10, 8'h10); // MCR = 0x10 (LOOP=1)
+
+            // Send 0xBB through loopback.
+            axi_write(5'h00, 8'hBB); // THR
+
+            // Wait for TX → RX pipeline (8N1 = 160 clocks + sync + RX pipeline overhead)
+            next(200);
+
+            // ── LSR: DR should be 1 (data in FIFO) ───────────────────────
+            axi_read(5'h14, rdata);
+            if (!rdata[0]) $fatal(1, "LSR.DR: expected 1 (data ready), got LSR=0x%02X", rdata);
+
+            // ── RBR: data should be 0xBB ──────────────────────────────────
+            axi_read(5'h00, rdata);
+            if (rdata !== 8'hBB) $fatal(1, "RBR: expected 0xBB, got 0x%02X", rdata);
+
+            // ── LSR after read: DR should be 0 (FIFO empty now) ──────────
+            axi_read(5'h14, rdata);
+            if (rdata[0]) $fatal(1, "LSR.DR: expected 0 after RBR read, got LSR=0x%02X", rdata);
+
+            // ── Send a second byte to verify multiple round-trips ─────────
+            axi_write(5'h00, 8'h3C); // THR
+            next(200);
+
+            axi_read(5'h00, rdata);
+            if (rdata !== 8'h3C) $fatal(1, "RBR 2nd: expected 0x3C, got 0x%02X", rdata);
+
+            $finish();
+        end
+    endmodule
+}}}
+
+// ─── Test 4: Interrupt assertion and deassertion ──────────────────────────────
+// Loopback with IER.ERBFI and MCR.OUT2 set.
+// Checks o_intr goes high when data arrives in RX FIFO (RDA) and falls after
+// RBR read (FIFO drained).  Also checks THRE interrupt with IER.ETBEI.
+#[test(test_uart_16550_interrupt)]
+embed (inline) sv{{{
+    module test_uart_16550_interrupt;
+        logic        clk;
+        logic        rst_n;
+        logic        axi_awvalid;
+        logic        axi_awready;
+        logic [4:0]  axi_awaddr;
+        logic [2:0]  axi_awprot;
+        logic        axi_wvalid;
+        logic        axi_wready;
+        logic [31:0] axi_wdata;
+        logic [3:0]  axi_wstrb;
+        logic        axi_bvalid;
+        logic        axi_bready;
+        logic [1:0]  axi_bresp;
+        logic        axi_arvalid;
+        logic        axi_arready;
+        logic [4:0]  axi_araddr;
+        logic [2:0]  axi_arprot;
+        logic        axi_rvalid;
+        logic        axi_rready;
+        logic [31:0] axi_rdata;
+        logic [1:0]  axi_rresp;
+        logic        uart_rxd;
+        logic        uart_txd;
+        logic        uart_cts;
+        logic        uart_rts;
+        logic        intr;
+
+        uart_16550_veryl_Uart16550 u_dut (
+            .i_clk        (clk        ),
+            .i_rst_n      (rst_n      ),
+            .i_axi_awvalid(axi_awvalid),
+            .o_axi_awready(axi_awready),
+            .i_axi_awaddr (axi_awaddr ),
+            .i_axi_awprot (axi_awprot ),
+            .i_axi_wvalid (axi_wvalid ),
+            .o_axi_wready (axi_wready ),
+            .i_axi_wdata  (axi_wdata  ),
+            .i_axi_wstrb  (axi_wstrb  ),
+            .o_axi_bvalid (axi_bvalid ),
+            .i_axi_bready (axi_bready ),
+            .o_axi_bresp  (axi_bresp  ),
+            .i_axi_arvalid(axi_arvalid),
+            .o_axi_arready(axi_arready),
+            .i_axi_araddr (axi_araddr ),
+            .i_axi_arprot (axi_arprot ),
+            .o_axi_rvalid (axi_rvalid ),
+            .i_axi_rready (axi_rready ),
+            .o_axi_rdata  (axi_rdata  ),
+            .o_axi_rresp  (axi_rresp  ),
+            .i_uart_rxd   (uart_rxd   ),
+            .o_uart_txd   (uart_txd   ),
+            .i_uart_cts   (uart_cts   ),
+            .o_uart_rts   (uart_rts   ),
+            .o_intr       (intr       )
+        );
+
+        initial clk = 0;
+        always #5 clk = ~clk;
+
+        task automatic next(input int n);
+            repeat (n) @(posedge clk);
+        endtask
+
+        task automatic axi_write(input logic [4:0] addr, input logic [7:0] data);
+            axi_awvalid = 1; axi_awaddr = addr; axi_awprot = 0;
+            axi_wvalid  = 1; axi_wdata  = {24'h0, data}; axi_wstrb = 4'h1;
+            @(posedge clk);
+            axi_awvalid = 0; axi_wvalid = 0;
+            @(posedge clk);
+            axi_bready = 1;
+            @(posedge clk);
+            axi_bready = 0;
+        endtask
+
+        task automatic axi_read(input logic [4:0] addr, output logic [7:0] data);
+            axi_arvalid = 1; axi_araddr = addr; axi_arprot = 0;
+            @(posedge clk);
+            axi_arvalid = 0;
+            @(posedge clk);
+            data = axi_rdata[7:0];
+            axi_rready = 1;
+            @(posedge clk);
+            axi_rready = 0;
+        endtask
+
+        logic [7:0] rdata;
+
+        initial begin
+            rst_n       = 0;
+            axi_awvalid = 0; axi_wvalid = 0; axi_bready = 0;
+            axi_arvalid = 0; axi_rready = 0;
+            axi_wstrb   = 4'h1;
+            uart_rxd    = 1;
+            uart_cts    = 1;
+
+            next(5); rst_n = 1; next(3);
+
+            // ── THRE interrupt test ───────────────────────────────────────
+            // TX is idle from reset.  Enable ETBEI (IER[1]) and OUT2 (MCR[3]).
+            // The THRE interrupt should assert immediately (TX FIFO empty).
+            axi_write(5'h0C, 8'h80); // LCR: DLAB=1
+            axi_write(5'h00, 8'h01); // DLL=1
+            axi_write(5'h0C, 8'h03); // LCR: 8N1, DLAB=0
+            axi_write(5'h10, 8'h18); // MCR = 0x18 (LOOP=1, OUT2=1)
+            axi_write(5'h04, 8'h02); // IER = 0x02 (ETBEI only)
+
+            // TX idle + ETBEI + OUT2 → THRE pending → intr=1.
+            if (!intr)
+                $fatal(1, "THRE: o_intr should be 1 after enabling ETBEI with idle TX");
+
+            // IIR should report THRE (0xC2).
+            axi_read(5'h08, rdata);
+            if (rdata !== 8'hC2) $fatal(1, "IIR THRE: expected 0xC2, got 0x%02X", rdata);
+
+            // Write THR → TX FIFO becomes non-empty → TX no longer idle → THRE clears.
+            axi_write(5'h00, 8'hAA); // THR
+            // At this point TX FIFO has data → o_idle = 0 → THRE pending = 0.
+            if (intr)
+                $fatal(1, "THRE: o_intr should be 0 immediately after THR write (TX busy)");
+
+            // ── RDA interrupt test ────────────────────────────────────────
+            // Wait for loopback byte to arrive in RX FIFO, then enable ERBFI.
+            next(200);
+
+            // Enable ERBFI (and keep ETBEI off for clarity; TX is idle again).
+            axi_write(5'h04, 8'h01); // IER = 0x01 (ERBFI only)
+
+            // RX FIFO has ≥1 byte (trigger=1 by default) → RDA pending → intr=1.
+            if (!intr)
+                $fatal(1, "RDA: o_intr should be 1 when RX FIFO has data");
+
+            // IIR should report RDA (0xC4).
+            axi_read(5'h08, rdata);
+            if (rdata !== 8'hC4) $fatal(1, "IIR RDA: expected 0xC4, got 0x%02X", rdata);
+
+            // Read RBR to drain the FIFO.
+            axi_read(5'h00, rdata);
+            if (rdata !== 8'hAA) $fatal(1, "RBR: expected 0xAA, got 0x%02X", rdata);
+
+            // FIFO now empty → RDA clears → intr=0.
+            if (intr)
+                $fatal(1, "RDA: o_intr should be 0 after RBR read drains FIFO");
+
+            // IIR should show no interrupt (0xC3).
+            axi_read(5'h08, rdata);
+            if (rdata !== 8'hC3) $fatal(1, "IIR idle: expected 0xC3, got 0x%02X", rdata);
+
+            $finish();
+        end
+    endmodule
+}}}
